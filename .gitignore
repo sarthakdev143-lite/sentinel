@@ -1,0 +1,47 @@
+# Nim build artifacts
+nimcache/
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.pch
+*.nimble/
+*.nims
+*.nimcache/
+*.cache
+*.shared
+
+# Generated C / C++ files
+*.c
+*.h
+
+# Build and deployment folders
+/build/
+/downloads/
+/logs/
+/uploads/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor files
+.vscode/
+*.swp
+*~
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Ignore package manager lock files if not relevant
+# (uncomment if you add npm / pip / other package files)
+# package-lock.json
+# yarn.lock
+# Pipfile.lock
