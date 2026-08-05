@@ -39,6 +39,9 @@ desktop.ini
 *.tmp
 *.temp
 *.log
+*.bak.trash
+
+tests/
 
 # Ignore package manager lock files if not relevant
 # (uncomment if you add npm / pip / other package files)

