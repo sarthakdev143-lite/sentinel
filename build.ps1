@@ -59,37 +59,39 @@ $BaseFlags = @(
 # Build the c2_server first (no variants)
 Write-Host "[*] Building c2_server..." -ForegroundColor Cyan
 $xorKeyPath = Join-Path $SrcDir "xorkey.nim"
-New-XorKeyNim -OutPath $xorKeyPath
-$ServerFlags = @("c", "-d:release", "-d:ssl", "--threads:on", "--opt:speed")
-& $Nim @ServerFlags `
-    --out:(Join-Path $BuildDir "c2_server.exe") `
-    (Join-Path $SrcDir "c2_server.nim")
-if ($LASTEXITCODE -ne 0) { throw "c2_server build failed" }
-
-# Build each agent variant
-$Variants = @{
-    "agent_silent.exe"      = @()
-    "agent_engagement.exe"  = @("-d:variant_engagement")
-    "agent_aggressive.exe"  = @("-d:variant_aggressive")
-}
-
-foreach ($kv in $Variants.GetEnumerator()) {
-    $name = $kv.Key
-    $defines = $kv.Value
-    # Generate a unique XOR key for this variant
-    $xorKeyPath = Join-Path $SrcDir "xorkey.nim"
+try {
     New-XorKeyNim -OutPath $xorKeyPath
-    Write-Host "[*] Building $name ..." -ForegroundColor Cyan
-    $flags = @("c", "-d:release", "-d:ssl", "--opt:size", "--app:gui", "--passL:-s") + $defines
-    & $Nim @flags `
-        --out:(Join-Path $BuildDir $name) `
-        (Join-Path $SrcDir "agent.nim")
-    if ($LASTEXITCODE -ne 0) { throw "$name build failed" }
-}
+    $ServerFlags = @("c", "-d:release", "-d:ssl", "--threads:on", "--opt:speed")
+    & $Nim @ServerFlags `
+        --out:(Join-Path $BuildDir "c2_server.exe") `
+        (Join-Path $SrcDir "c2_server.nim")
+    if ($LASTEXITCODE -ne 0) { throw "c2_server build failed" }
 
-# Clean up the generated xorkey.nim so it doesn't accidentally get committed
-$xorKeyPath = Join-Path $SrcDir "xorkey.nim"
-if (Test-Path $xorKeyPath) { Remove-Item -Force $xorKeyPath }
+    # Build each agent variant
+    $Variants = @{
+        "agent_silent.exe"      = @()
+        "agent_engagement.exe"  = @("-d:variant_engagement")
+        "agent_aggressive.exe"  = @("-d:variant_aggressive")
+    }
+
+    foreach ($kv in $Variants.GetEnumerator()) {
+        $name = $kv.Key
+        $defines = $kv.Value
+        # Generate a unique XOR key for this variant
+        New-XorKeyNim -OutPath $xorKeyPath
+        Write-Host "[*] Building $name ..." -ForegroundColor Cyan
+        $flags = @("c", "-d:release", "-d:ssl", "--opt:size", "--app:gui", "--passL:-s") + $defines
+        & $Nim @flags `
+            --out:(Join-Path $BuildDir $name) `
+            (Join-Path $SrcDir "agent.nim")
+        if ($LASTEXITCODE -ne 0) { throw "$name build failed" }
+    }
+} finally {
+    # Always clean up the generated xorkey.nim so it doesn't
+    # accidentally get committed or poison the next manual compile
+    # with a wrong-length key.
+    if (Test-Path $xorKeyPath) { Remove-Item -Force $xorKeyPath }
+}
 
 # Build the unit test (no variants)
 Write-Host "[*] Building tests..." -ForegroundColor Cyan

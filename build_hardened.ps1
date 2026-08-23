@@ -120,10 +120,16 @@ foreach ($kv in $Variants.GetEnumerator()) {
         "--nimcache:" + (Join-Path $BuildDir ("cache_" + $name.Replace(".exe", "")))
     )
 
-    # Redirect stderr to stdout; Nim writes compile progress dots to stderr
-    & $Nim @flags `
-        --out:(Join-Path $BuildDir $name) `
-        (Join-Path $SrcDir "hardened\agent_hardened.nim") 2>&1 | Out-Null
+    try {
+        # Redirect stderr to stdout; Nim writes compile progress dots to stderr
+        & $Nim @flags `
+            --out:(Join-Path $BuildDir $name) `
+            (Join-Path $SrcDir "hardened\agent_hardened.nim") 2>&1 | Out-Null
+    } finally {
+        # Always clean up so a stale 32-byte key can't poison a
+        # later baseline build with the wrong key length.
+        if (Test-Path $xorKeyPath) { Remove-Item -Force $xorKeyPath }
+    }
 
     $ErrorActionPreference = $prevEAP
 

@@ -1,3 +1,5 @@
+.env
+
 # Nim build artifacts
 nimcache/
 *.o
@@ -41,10 +43,37 @@ desktop.ini
 *.log
 *.bak.trash
 
-tests/
+# Test artifacts (keep tests/*.py and tests/*.nim tracked)
+build
+build_cache
+tests/cache/
+tests/artifacts/
+tests/__pycache__/
+
+# Generated per-build secrets - NEVER commit
+xorkey.nim
+telegram/xorkey.nim
+config.nim
+c2_override.nim
+.env
+
+# Local build scratch dirs
+/build2/
+/build3/
+/build4/
+/sentinel_agg_cache*/
+telegram/cache_*/
+
+# Built deploy bundles (binaries + DLLs)
+telegram/deploy_bundle/
+telegram/telegram/
 
 # Ignore package manager lock files if not relevant
 # (uncomment if you add npm / pip / other package files)
 # package-lock.json
 # yarn.lock
 # Pipfile.lock
+
+# Generated per-build TLS pin wrapper
+pin.nim
+build-command.txt
