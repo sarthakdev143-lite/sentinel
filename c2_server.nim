@@ -1255,6 +1255,15 @@ proc webHandler(req: Request) {.async, gcsafe.} =
     })
     await req.respond(Http200, DASHBOARD_HTML, hdrs)
     return
+  if m == HttpGet and url == "/api/session":
+    # Dashboard fetches this (cookie/basic-auth protected) to obtain
+    # the per-boot WS session token for the Sec-WebSocket-Protocol
+    # auth path. Never logged, never in URLs.
+    var tok = ""
+    {.cast(gcsafe).}:
+      tok = dashSessToken
+    await jsonResp(req, Http200, $ %* {"token": tok})
+    return
   if m == HttpGet and url == "/api/agents":
     await apiAgents(req); return
   if m == HttpGet and url.startsWith("/api/log/"):
@@ -1386,6 +1395,7 @@ proc main() {.async.} =
     var cookie = ""
     var origin = ""
     var hostHdr = ""
+    var wsProtoTok = ""
     for line in lines[1..^1]:
       let kv = line.split(": ", 1)
       if kv.len == 2:
@@ -1393,19 +1403,34 @@ proc main() {.async.} =
         elif kv[0].toLowerAscii == "cookie": cookie = kv[1]
         elif kv[0].toLowerAscii == "origin": origin = kv[1]
         elif kv[0].toLowerAscii == "host": hostHdr = kv[1]
+        elif kv[0].toLowerAscii == "sec-websocket-protocol":
+          # Some browsers withhold cookies on cross-port WS upgrades;
+          # the dashboard passes the session token as a subprotocol.
+          wsProtoTok = kv[1]
 
-    # Auth — per-boot session cookie only. The old ?token= URL path
-    # leaked credentials into logs and is gone.
+    # Auth — per-boot session token via cookie OR subprotocol header.
     var authed = false
+    var sessTokSnapshot = ""
     {.cast(gcsafe).}:
-      authed = (dashSessToken.len > 0 and
-                WS_COOKIE_NAME & "=" & dashSessToken in cookie)
+      sessTokSnapshot = dashSessToken
+    authed = (sessTokSnapshot.len > 0 and
+              (WS_COOKIE_NAME & "=" & sessTokSnapshot in cookie or
+               wsProtoTok == sessTokSnapshot))
     if authed and origin.len > 0:
       # Cross-site WebSocket hijack guard: only same-host origins.
-      let oHost = origin.split("://")[^1].split('/', 1)[0]
+      # Both sides are compared WITHOUT their ports (the dashboard
+      # runs on :8080 while WS lives on :8081, and Origin always
+      # carries its port - comparing raw strings made every browser
+      # handshake fail with 401).
+      let oHost = origin.split("://")[^1].split('/', 1)[0].split(':', 1)[0]
       let hHost = hostHdr.split(':', 1)[0]
       if oHost.toLowerAscii != hHost.toLowerAscii:
         authed = false
+    if not authed:
+      when defined(ws_auth_debug):
+        echo "[wsdbg] 401 path=", path
+        for line in lines[1..^1]: echo "[wsdbg]   H: ", line
+        echo "[wsdbg]   expected=", sessTokSnapshot
     if not authed:
       try: await sock.send("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
       except: discard
@@ -1427,8 +1452,13 @@ proc main() {.async.} =
     var bs: seq[byte] = @[]
     for b in digest: bs.add(byte(b))
     let accept = base64.encode(bs)
+    # Echo the subprotocol only when it carried the session token
+    # (browsers reject the handshake if we invent one they didn't ask for).
+    let protoEcho = if wsProtoTok == sessTokSnapshot and sessTokSnapshot.len > 0:
+      "Sec-WebSocket-Protocol: " & sessTokSnapshot & "\r\n"
+    else: ""
     try:
-      await sock.send("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " & accept & "\r\n\r\n")
+      await sock.send("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " & accept & "\r\n" & protoEcho & "\r\n")
     except:
       try: sock.close()
       except: discard

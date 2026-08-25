@@ -549,10 +549,23 @@ async function backfillLog(id){
 
 /* ================= websockets ================= */
 let wsRetryMs = 1000;
+let wsToken = null;   // per-boot session token (via /api/session)
+async function ensureToken(){
+  if (wsToken) return wsToken;
+  try{ wsToken = (await api('/api/session')).token || ''; }catch(e){ wsToken = ''; }
+  return wsToken;
+}
 function wsProto(){ return location.protocol === 'https:' ? 'wss://' : 'ws://'; }
+// Some browsers withhold cookies on cross-port WS upgrades, so auth
+// rides in Sec-WebSocket-Protocol (echoed by the server when valid).
+async function openDashWs(path){
+  const tok = await ensureToken();
+  return tok ? new WebSocket(wsProto() + location.hostname + ':8081' + path, tok)
+             : new WebSocket(wsProto() + location.hostname + ':8081' + path);
+}
 
-function connectAgentsWs(){
-  const sock = new WebSocket(wsProto() + location.hostname + ':8081/agents');
+async function connectAgentsWs(){
+  const sock = await openDashWs('/agents');
   S.wsAgents = sock;
   sock.onopen = () => { setConn(true); wsRetryMs = 1000; };
   sock.onmessage = ev => {
@@ -580,10 +593,10 @@ function connectAgentsWs(){
   };
   sock.onerror = () => sock.close();
 }
-function connectLogWs(id){
+async function connectLogWs(id){
   if (S.wsLog){ try{ S.wsLog.close(); }catch(e){} S.wsLog = null; }
   if (!id) return;
-  const sock = new WebSocket(wsProto() + location.hostname + ':8081/log/' + id);
+  const sock = await openDashWs('/log/' + id);
   S.wsLog = sock;
   sock.onopen = () => backfillLog(id);
   sock.onmessage = ev => {
@@ -763,7 +776,10 @@ document.addEventListener('keydown', e => {
   if (e.key === '/' && document.activeElement.tagName !== 'INPUT'){
     e.preventDefault(); $('cmdInput').focus();
   }
-  if (e.key === 'Escape'){ $('modal').classList.remove('on'); }
+  if (e.key === 'Escape'){
+    $('palette').classList.remove('on');
+    $('modal').classList.remove('on');
+  }
 });
 $('modalClose').onclick = () => $('modal').classList.remove('on');
 $('modal').addEventListener('click', e => { if (e.target.id === 'modal') $('modal').classList.remove('on'); });
