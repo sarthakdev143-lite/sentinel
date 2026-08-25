@@ -89,6 +89,7 @@ $flags = @(
     "-d:release"
     "--opt:size"
     "--app:gui"
+    "--path:common"
     "--passL:-s"
     "-d:$TransportFlag"
     "-d:variant_$Variant"

