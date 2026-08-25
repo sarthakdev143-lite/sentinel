@@ -37,8 +37,12 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 AGENT_PORT = 8443
 HTTP_PORT = 8080
 HOST = "127.0.0.1"
-SECRET = "sentinel-engagement-q4-2026-echo-tango-whiskey"
-WEB_AUTH = ("operator", "S3nt1n3l-C2-D3v-Only-CHANGEME")
+# Engagement creds come from the environment so rotating them never
+# requires editing this file (defaults match the repo's dev constants).
+import os as _os
+SECRET = _os.environ.get("SENTINEL_SECRET", "sentinel-engagement-q4-2026-echo-tango-whiskey")
+WEB_AUTH = (_os.environ.get("SENTINEL_WEB_USER", "operator"),
+            _os.environ.get("SENTINEL_WEB_PASS", "S3nt1n3l-C2-D3v-Only-CHANGEME"))
 AAD_DIR_S2A = b"\x00"
 AAD_DIR_A2S = b"\x01"
 SERVER_EXE = ROOT / "build" / "c2_server.exe"
