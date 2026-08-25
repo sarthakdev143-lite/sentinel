@@ -61,6 +61,10 @@ Write-Host "[*] Building c2_server..." -ForegroundColor Cyan
 $xorKeyPath = Join-Path $SrcDir "xorkey.nim"
 try {
     New-XorKeyNim -OutPath $xorKeyPath
+    # Nim writes progress dots/hints to stderr; with redirected stderr
+    # and EAP=Stop that surfaces as a terminating NativeCommandError.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     $ServerFlags = @("c", "-d:release", "-d:ssl", "--threads:on", "--opt:speed")
     & $Nim @ServerFlags `
         --out:(Join-Path $BuildDir "c2_server.exe") `
@@ -86,6 +90,7 @@ try {
             (Join-Path $SrcDir "agent.nim")
         if ($LASTEXITCODE -ne 0) { throw "$name build failed" }
     }
+    $ErrorActionPreference = $prevEAP
 } finally {
     # Always clean up the generated xorkey.nim so it doesn't
     # accidentally get committed or poison the next manual compile
@@ -97,9 +102,12 @@ try {
 Write-Host "[*] Building tests..." -ForegroundColor Cyan
 $TestDir = Join-Path $ProjectDir "tests"
 if (Test-Path (Join-Path $TestDir "test_crypto.nim")) {
+    $prevEAP2 = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     & $Nim @BaseFlags `
         --out:(Join-Path $BuildDir "test_crypto.exe") `
         (Join-Path $TestDir "test_crypto.nim")
+    $ErrorActionPreference = $prevEAP2
     if ($LASTEXITCODE -ne 0) { Write-Warning "test_crypto build failed (non-fatal)" }
 }
 
