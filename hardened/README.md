@@ -249,7 +249,7 @@ suspicious DLLs in the static IAT. All sensitive libraries are loaded dynamicall
 
 ### Sensitive String Scan
 All 3 variants verified clean for:
-- `sentinel-engagement` (agent secret)
+- generated engagement secret material
 - `amsi.dll`, `AmsiScanBuffer`, `EtwEventWrite`
 - `__EventFilter`, `CommandLineEventConsumer`, `__FilterToConsumerBinding`
 - `Win32_LogonSession`, `__InstanceCreationEvent`
@@ -257,12 +257,12 @@ All 3 variants verified clean for:
 - `discord.com`, `hooks.slack.com`
 
 ### E2E Harness
-`python tests/e2e_harness.py --start` — **26/26 assertions passing** (c2_server + protocol)
+`python tests/e2e_harness.py --start` — WS protocol and dashboard integration checks (configure the current C2 environment variables first)
 
 ## Security Considerations
 
 1. **Syscall numbers**: Resolved dynamically from ntdll prologue, not hardcoded.
-2. **String obfuscation**: All literals stream-cipher-encoded with per-build 32-byte key.
+2. **String obfuscation**: Selected signature-sensitive strings are encoded with the generated per-build 32-byte key; operational command labels may remain literal.
 3. **Memory zeroing**: Secret and keys are zeroed before process exit.
 4. **Binary overwrite**: 3-pass overwrite (random/zeros/random) before deletion.
 5. **Event log clearing**: Application, System, Security, Defender, PowerShell logs.
@@ -300,7 +300,7 @@ would require in-memory-only execution or a kernel driver
 .\build_hardened.ps1                          # Build all 3 variants
 python tests/pe_imports.py build\agent_hardened_aggressive.exe  # IAT check
 python tests/verify_hardened.py               # Comprehensive binary scan
-python tests/e2e_harness.py --start           # 26 assertions
+python tests/e2e_harness.py --start           # WS integration checks
 ```
 
 ### Manual

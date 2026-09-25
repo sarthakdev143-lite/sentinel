@@ -12,7 +12,7 @@
   - [x] Expected: `KERNEL32.dll` + `USER32.dll` + `msvcrt.dll` only (no `ntdll.dll`, `amsi.dll`, `winmm.dll`, `avicap32.dll`)
   - [x] Verified via `pefile`: all 3 variants show exactly 3 DLLs
 - [x] Run E2E harness: `python tests/e2e_harness.py --start`
-  - [x] Result: **26/26 assertions passed**
+  - [x] Result: WS integration checks passed (set `C2_AGENT_PASSPHRASE`, `C2_WEB_USER`, and `C2_WEB_PASSWORD` first)
 
 ### OPSEC Pre-Flight
 - [x] Verify XOR key was regenerated per binary (unique ciphertext in each)
@@ -21,13 +21,13 @@
   - Verified: `amsi.dll`, `AmsiScanBuffer` — **CLEAN** in all 3 binaries
 - [x] Run `strings agent_hardened_aggressive.exe | grep -i "etw"` → expect 0 hits
   - Verified: `EtwEventWrite` — **CLEAN** in all 3 binaries
-- [x] Run `strings agent_hardened_aggressive.exe | grep "sentinel-engagement"` → expect 0 hits
-  - Verified: agent secret **absent** from all 3 binaries
+- [x] Run `python tests/scan_strings.py build\agent_hardened_aggressive.exe` and review the report
+  - Verified: the previous engagement secret is **absent** from all 3 binaries
 - [x] Verify WMI persistence strings are obfuscated
   - Verified: `__EventFilter`, `CommandLineEventConsumer`, `__FilterToConsumerBinding`, `Win32_LogonSession`, `__InstanceCreationEvent` — **ALL CLEAN** in all 3 binaries
   - Strings decrypted at runtime via `obfDec()` from compile-time `encodeObf()` consts
 - [x] Verify agent secret is XOR-obfuscated (not plaintext in .rdata)
-  - `S_AGENT_SECRET = encodeObf("sentinel-engagement-q4-2026-echo-tango-whiskey")`
+  - `S_AGENT_SECRET = encodeObf(SECRET_PLAINTEXT)` from generated `secret.nim`
   - Decrypted on first call via `agentSecret()` proc with lock + cache
 - [x] Verify webhook URLs are obfuscated
   - `discord.com`, `hooks.slack.com` — **CLEAN** in all 3 binaries

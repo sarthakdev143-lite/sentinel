@@ -7,12 +7,12 @@
 | Binary | Source | Purpose |
 |---|---|---|
 | `sentinel_tg_*.exe` | `sentinel.nim -d:c2_tg` | **Primary** — Telegram Bot API, native WinHTTP, 3 persistence levels |
-| `sentinel_ws_*.exe` | `sentinel.nim -d:c2_ws` | WebSocket-over-TLS, needs `c2_server` |
+| `sentinel_ws_*.exe` | `sentinel.nim -d:c2_ws` | WebSocket, needs `c2_server`; use an external TLS terminator for `wss://` |
 | `sentinel_both_*.exe` | `sentinel.nim -d:c2_both` | WS primary + Telegram notify |
 | `c2_server.exe` | `c2_server.nim` | Agent listener (8443) + dashboard (8080) + dashboard WS push (8081) |
 | `agent_*.exe` / `agent_hardened_*.exe` / `agent_telegram.exe` | `agent.nim` / `hardened/` / `telegram/` | Frozen legacy variants |
 
-Each sentinel build has three persistence levels: `silent` (no auto-persist), `engagement` (auto-persist on first connect), `aggressive` (persist + Defender exclusion registry write).
+Variant flags are transport-specific: the WS path follows the `silent`/`engagement`/`aggressive` auto-persistence flags, while the current Telegram path performs startup persistence unless `C2_NO_PERSIST=1`.
 
 ```
 sentinel.nim  ~3100 lines — combines agent + hardened evasion + telegram transport
@@ -50,7 +50,7 @@ Runtime env overrides (no rebuild needed): `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_
 ```powershell
 # On a test host (no persistence, verbose log):
 $env:TELEGRAM_BOT_TOKEN = "<token>"; $env:TELEGRAM_CHAT_ID = "<id>"
-$env:C2_NO_PERSIST = "1"; $env:C2_NO_SANDBOX_CHECK = "1"; $env:C2_LOG_FILE = "$env:TEMP\svc-X7K.log"
+$env:C2_NO_PERSIST = "1"; $env:C2_NO_SANDBOX_CHECK = "1"; $env:C2_LOG_FILE = "$env:TEMP\sentinel_test.log"
 .\build\sentinel_tg_aggressive.exe
 # → "SentinelC2 / Sentinel online" lands in your Telegram chat
 ```
@@ -78,7 +78,7 @@ Operator commands in Telegram (`/help` for the full list):
 ## Verify
 
 ```powershell
-python tests/e2e_harness.py --start              # 26 assertions (WS path)
+python tests/e2e_harness.py --start              # WS path; configure C2_AGENT_PASSPHRASE and C2_WEB_* first
 nim c -r -d:release --nimcache:tests/cache tests/test_crypto.nim
 python tests/pe_imports.py build\agent_silent.exe
 python tests/verify_hardened.py
@@ -96,7 +96,7 @@ Target (Windows)              Telegram cloud         Operator phone/desktop
 +------------------+          +--------------+       +------------------+
 ```
 
-WS/both transports instead use `ws://<server>:8443` with AES-256-GCM per-agent session crypto (HMAC-SHA256 registration, AAD-bound frames, counter nonce) and the `c2_server` dashboard on 8080/8081. See `DEPLOY.md` for the Tailscale Funnel path.
+WS/both transports use `ws://<server>:8443` by default; put an external TLS terminator in front of the listener when using `wss://`. The `c2_server` dashboard is plain HTTP on 8080 by default. See `DEPLOY.md` for the reverse-proxy path.
 
 ## Protocol (TG)
 
@@ -104,7 +104,7 @@ Long-poll `getUpdates` (offset = last update_id+1, timeout = `C2_POLL_TIMEOUT`),
 
 ## OPSEC notes
 
-- Every signatured literal is `encodeObf`-obfuscated; per-build 32-byte key via `xorkey.nim` (stream cipher, compile-time nonce)
+- Selected signature-sensitive literals use the neighboring `S_*`/`encodeObf` pattern with a per-build key; not every operational string is encoded.
 - Dynamic WinHTTP resolution — TG build IAT has no `winhttp.dll`
 - `AGENTS.md` lists all compile-time knobs; `SENTINELC2` docs live only in `AGENTS.md` — keep them out of tracked source
 

