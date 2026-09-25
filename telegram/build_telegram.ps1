@@ -179,7 +179,7 @@ function Inject-Secrets {
     $src = Replace-Placeholder -Source $src -Name "S_MUTEX"     -Encoded $mutexBytes
 
     $built = Join-Path $SrcDir "agent_telegram_built.nim"
-    Set-Content -Path $built -Value $src -Encoding UTF8 -NoNewline
+    [System.IO.File]::WriteAllText($built, $src, (New-Object System.Text.UTF8Encoding($false)))
     return $built
 }
 

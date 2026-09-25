@@ -52,7 +52,11 @@ tests/__pycache__/
 
 # Generated per-build secrets - NEVER commit
 xorkey.nim
+prefix.nim
+secret.nim
+telegram_creds.nim
 telegram/xorkey.nim
+telegram/agent_telegram_built.nim
 config.nim
 c2_override.nim
 .env
