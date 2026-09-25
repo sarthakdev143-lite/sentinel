@@ -10,6 +10,11 @@ jobs:
   ci:
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      NIM: nim
+      C2_AGENT_PASSPHRASE: ci-only-agent-secret-change-me
+      C2_WEB_USER: ci-operator
+      C2_WEB_PASSWORD: ci-only-dashboard-password-change-me
 
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +56,10 @@ jobs:
       - name: Crypto unit tests
         run: build/test_crypto.exe
 
-      - name: E2E harness (26 assertions, WS path)
+      - name: Log crypto unit tests
+        run: nim c -r -d:release --path:common --nimcache:tests/cache tests/test_log_crypto.nim
+
+      - name: E2E harness (WS path)
         run: python tests/e2e_harness.py --start
 
       - name: IAT discipline (baseline)
@@ -63,15 +71,11 @@ jobs:
           .\build_hardened.ps1
           python tests/verify_hardened.py
 
-      - name: Rebuild server (hardened wiped build/)
+      - name: Rebuild server and baseline (hardened wiped build/)
         shell: powershell
         run: |
-          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-          $bytes = New-Object byte[] 16; $rng.GetBytes($bytes)
-          $hex = ($bytes | ForEach-Object { "0x{0:x2}" -f $_ }) -join ', '
-          Set-Content -Path xorkey.nim -Value "const XorKey: array[16, byte] = [byte $hex]`n" -Encoding UTF8
-          nim c -d:release -d:ssl --threads:on --opt:speed --out:build/c2_server.exe c2_server.nim
-          Remove-Item xorkey.nim -Force
+          .\build.ps1
+          if (-not (Test-Path build/c2_server.exe)) { throw "c2_server.exe missing after rebuild" }
 
       - name: Sentinel TG + WS compile checks (dummy creds)
         shell: powershell

